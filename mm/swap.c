@@ -45,6 +45,24 @@
 /* How many pages do we try to swap or page in/out together? */
 int page_cluster;
 
+#ifdef CONFIG_DUAL_PATH_SWAP
+int sysctl_dual_path_swap __read_mostly;
+
+static int __init dual_path_swap_setup(char *str)
+{
+	int v, err;
+
+	if (!str)
+		return 0;
+	err = kstrtoint(str, 0, &v);
+	if (err)
+		return 0;
+	sysctl_dual_path_swap = v != 0;
+	return 1;
+}
+__setup("dual_path_swap=", dual_path_swap_setup);
+#endif
+
 /* Protecting only lru_rotate.pvec which requires disabling interrupts */
 struct lru_rotate {
 	local_lock_t lock;

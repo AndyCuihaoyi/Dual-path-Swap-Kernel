@@ -9,6 +9,7 @@
 #include <linux/stddef.h>
 #include <linux/mm.h>
 #include <linux/mmzone.h>
+#include <linux/lockdep.h>
 
 struct pglist_data *first_online_pgdat(void)
 {
@@ -94,7 +95,38 @@ void lruvec_init(struct lruvec *lruvec)
 
 	for_each_lru(lru)
 		INIT_LIST_HEAD(&lruvec->lists[lru]);
+
+#ifdef CONFIG_DUAL_PATH_SWAP
+	INIT_LIST_HEAD(&lruvec->agg_list);
+#endif
 }
+
+#ifdef CONFIG_DUAL_PATH_SWAP
+
+void lruvec_page_group_add_head(struct lruvec *lruvec, struct page_group *grp)
+{
+	lockdep_assert_held(&lruvec_pgdat(lruvec)->lru_lock);
+	list_add(&grp->lru, &lruvec->agg_list);
+}
+
+void lruvec_page_group_add_tail(struct lruvec *lruvec, struct page_group *grp)
+{
+	lockdep_assert_held(&lruvec_pgdat(lruvec)->lru_lock);
+	list_add_tail(&grp->lru, &lruvec->agg_list);
+}
+
+void lruvec_page_group_move_tail(struct lruvec *lruvec, struct page_group *grp)
+{
+	lockdep_assert_held(&lruvec_pgdat(lruvec)->lru_lock);
+	list_move_tail(&grp->lru, &lruvec->agg_list);
+}
+
+void lruvec_page_group_del_init(struct page_group *grp)
+{
+	list_del_init(&grp->lru);
+}
+
+#endif /* CONFIG_DUAL_PATH_SWAP */
 
 #if defined(CONFIG_NUMA_BALANCING) && !defined(LAST_CPUPID_NOT_IN_PAGE_FLAGS)
 int page_cpupid_xchg_last(struct page *page, int cpupid)

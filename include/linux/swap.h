@@ -714,5 +714,18 @@ static inline bool mem_cgroup_swap_full(struct page *page)
 }
 #endif
 
+#if defined(CONFIG_DUAL_PATH_SWAP)
+extern int sysctl_dual_path_swap;
+static inline bool dual_path_swap_enabled(void)
+{
+	return sysctl_dual_path_swap != 0;
+}
+#else
+static inline bool dual_path_swap_enabled(void)
+{
+	return false;
+}
+#endif
+
 #endif /* __KERNEL__*/
 #endif /* _LINUX_SWAP_H */

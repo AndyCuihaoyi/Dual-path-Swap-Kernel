@@ -53,6 +53,41 @@ static inline void page_ext_init(void)
 
 struct page_ext *lookup_page_ext(const struct page *page);
 
+#if defined(CONFIG_DUAL_PATH_SWAP)
+struct page_group;
+
+#define MAX_PAGE_EXT_AGG_WINDOW		16
+
+/**
+ * struct page_ext_agg - Dual-path swap: per-page window ring + group link.
+ *
+ * Lives in the page_ext tail allocated by &page_ext_agg_ops.
+ */
+struct page_ext_agg {
+	u16			window_ids[MAX_PAGE_EXT_AGG_WINDOW];
+	int			head;
+	struct page_group	*group;
+};
+
+extern struct page_ext_operations page_ext_agg_ops;
+
+void page_ext_agg_reset(struct page_ext_agg *agg);
+
+static inline struct page_ext_agg *page_ext_get_agg(struct page_ext *page_ext)
+{
+	return (void *)page_ext + page_ext_agg_ops.offset;
+}
+
+static inline struct page_ext_agg *lookup_page_ext_agg(const struct page *page)
+{
+	struct page_ext *ext = lookup_page_ext(page);
+
+	if (!ext)
+		return NULL;
+	return page_ext_get_agg(ext);
+}
+#endif /* CONFIG_DUAL_PATH_SWAP */
+
 static inline struct page_ext *page_ext_next(struct page_ext *curr)
 {
 	void *next = curr;

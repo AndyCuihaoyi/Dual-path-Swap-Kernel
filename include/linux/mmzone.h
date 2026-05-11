@@ -292,7 +292,48 @@ struct lruvec {
 #ifdef CONFIG_MEMCG
 	struct pglist_data *pgdat;
 #endif
+#ifdef CONFIG_DUAL_PATH_SWAP
+	/*
+	 * Dual-path swap: one LRU of aggregated anonymous page groups
+	 * (struct page_group per node/memcg lruvec); not in lists[].
+	 */
+	struct list_head		agg_list;
+#endif
 };
+
+#ifdef CONFIG_DUAL_PATH_SWAP
+/**
+ * struct page_group - Aggregated anonymous pages for dual-path swap (per-lruvec agg_list).
+ *
+ * @page_list: Members in this group; @lru links into @lruvec->agg_list.
+ * Hold lruvec_pgdat(lruvec)->lru_lock when manipulating either.
+ */
+struct page_group {
+	struct list_head	page_list;
+	struct list_head	lru;
+	u16			hotness;
+	u64			creation_time;
+	u64			nr_pages;
+};
+
+static inline void page_group_init(struct page_group *pg)
+{
+	INIT_LIST_HEAD(&pg->page_list);
+	INIT_LIST_HEAD(&pg->lru);
+	pg->hotness = 0;
+	pg->creation_time = 0;
+	pg->nr_pages = 0;
+}
+
+#define lruvec_for_each_agg_page_group(group, lruvec)				\
+	list_for_each_entry((group), &(lruvec)->agg_list, lru)
+
+void lruvec_page_group_add_head(struct lruvec *lruvec, struct page_group *grp);
+void lruvec_page_group_add_tail(struct lruvec *lruvec, struct page_group *grp);
+void lruvec_page_group_move_tail(struct lruvec *lruvec, struct page_group *grp);
+void lruvec_page_group_del_init(struct page_group *grp);
+
+#endif /* CONFIG_DUAL_PATH_SWAP */
 
 /* Isolate unmapped pages */
 #define ISOLATE_UNMAPPED	((__force isolate_mode_t)0x2)

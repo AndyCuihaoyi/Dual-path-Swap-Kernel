@@ -2785,6 +2785,17 @@ static struct ctl_table vm_table[] = {
 		.extra1		= SYSCTL_ZERO,
 		.extra2		= &two_hundred,
 	},
+#ifdef CONFIG_DUAL_PATH_SWAP
+	{
+		.procname	= "dual_path_swap",
+		.data		= &sysctl_dual_path_swap,
+		.maxlen		= sizeof(sysctl_dual_path_swap),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
+#endif
 #ifdef CONFIG_HUGETLB_PAGE
 	{
 		.procname	= "nr_hugepages",

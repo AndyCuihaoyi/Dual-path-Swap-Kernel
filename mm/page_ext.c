@@ -58,12 +58,41 @@
  * can utilize this callback to initialize the state of it correctly.
  */
 
+#ifdef CONFIG_DUAL_PATH_SWAP
+
+void page_ext_agg_reset(struct page_ext_agg *agg)
+{
+	int i;
+
+	if (!agg)
+		return;
+	agg->head = 0;
+	agg->group = NULL;
+	for (i = 0; i < MAX_PAGE_EXT_AGG_WINDOW; i++)
+		agg->window_ids[i] = 0;
+}
+
+static bool page_ext_agg_need(void)
+{
+	return true;
+}
+
+struct page_ext_operations page_ext_agg_ops = {
+	.size = sizeof(struct page_ext_agg),
+	.need = page_ext_agg_need,
+};
+
+#endif /* CONFIG_DUAL_PATH_SWAP */
+
 static struct page_ext_operations *page_ext_ops[] = {
 #ifdef CONFIG_PAGE_OWNER
 	&page_owner_ops,
 #endif
 #if defined(CONFIG_IDLE_PAGE_TRACKING) && !defined(CONFIG_64BIT)
 	&page_idle_ops,
+#endif
+#ifdef CONFIG_DUAL_PATH_SWAP
+	&page_ext_agg_ops,
 #endif
 };
 

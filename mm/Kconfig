@@ -672,6 +672,22 @@ config ZSWAP_DEFAULT_ON
 	  The selection made here can be overridden by using the kernel
 	  command line 'zswap.enabled=' option.
 
+config DUAL_PATH_SWAP
+	bool "Dual-path swap (discrete vs aggregated anonymous reclaim)"
+	depends on ZSWAP
+	select PAGE_EXTENSION
+	help
+	  Build the experimental dual-path swap path alongside legacy reclaim.
+	  The discrete page path reuses the compressed swap cache (Zswap);
+	  the aggregated path targets sequential I/O for cold anon groups.
+
+	  Say N unless developing this subsystem. At runtime, the feature is
+	  off until enabled via /proc/sys/vm/dual_path_swap or boot option
+	  dual_path_swap=1.
+
+	  Selecting this option enables PAGE_EXTENSION and allocates extra
+	  per-page storage (see struct page_ext_agg) on top of struct page_ext.
+
 config ZPOOL
 	tristate "Common API for compressed memory storage"
 	help
