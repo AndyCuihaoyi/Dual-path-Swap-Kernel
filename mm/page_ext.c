@@ -6,6 +6,8 @@
 #include <linux/memory.h>
 #include <linux/vmalloc.h>
 #include <linux/kmemleak.h>
+#include <linux/slab.h>
+#include <linux/atomic.h>
 #include <linux/page_owner.h>
 #include <linux/page_idle.h>
 
@@ -60,16 +62,81 @@
 
 #ifdef CONFIG_DUAL_PATH_SWAP
 
+struct page_ext_agg_data *page_ext_agg_ensure_data(struct page_ext_agg *agg)
+{
+	struct page_ext_agg_data *alloc, *old;
+
+	if (!agg)
+		return NULL;
+
+	alloc = READ_ONCE(agg->data);
+	if (alloc)
+		return alloc;
+
+	/*
+	 * Callers (kaggswapd) run under pgdat->lru_lock or PTE page table lock;
+	 * must not use GFP_KERNEL here.
+	 */
+	alloc = kzalloc(sizeof(*alloc), GFP_NOWAIT | __GFP_NOWARN);
+	if (!alloc)
+		return NULL;
+
+	old = cmpxchg(&agg->data, NULL, alloc);
+	if (old) {
+		kfree(alloc);
+		return old;
+	}
+	return alloc;
+}
+
 void page_ext_agg_reset(struct page_ext_agg *agg)
 {
-	int i;
+	struct page_ext_agg_data *data;
 
 	if (!agg)
 		return;
-	agg->head = 0;
-	agg->group = NULL;
-	for (i = 0; i < MAX_PAGE_EXT_AGG_WINDOW; i++)
-		agg->window_ids[i] = 0;
+	data = xchg(&agg->data, NULL);
+	if (!data)
+		return;
+	WARN_ON_ONCE(data->group);
+	kfree(data);
+}
+
+/*
+ * Append one Transaction/window identifier to this page's fixed-size ring.
+ * Oldest slots are overwritten when the ring fills.
+ */
+void page_ext_agg_push_window(struct page_ext_agg *agg, u16 win_id)
+{
+	struct page_ext_agg_data *d = page_ext_agg_ensure_data(agg);
+	int i;
+
+	if (!d)
+		return;
+	i = d->head;
+	d->window_ids[i] = win_id;
+	i++;
+	if (i >= MAX_PAGE_EXT_AGG_WINDOW)
+		i = 0;
+	d->head = i;
+}
+
+void dual_path_page_ext_prepare_free(struct page *page, unsigned int order)
+{
+	unsigned int i, nr = 1U << order;
+
+	for (i = 0; i < nr; i++) {
+		struct page_ext_agg *agg = lookup_page_ext_agg(page + i);
+		struct page_ext_agg_data *data;
+
+		if (!agg)
+			continue;
+		data = xchg(&agg->data, NULL);
+		if (!data)
+			continue;
+		WARN_ON_ONCE(data->group);
+		kfree(data);
+	}
 }
 
 static bool page_ext_agg_need(void)

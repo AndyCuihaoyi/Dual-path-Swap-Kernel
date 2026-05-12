@@ -46,7 +46,7 @@
 int page_cluster;
 
 #ifdef CONFIG_DUAL_PATH_SWAP
-int sysctl_dual_path_swap __read_mostly;
+int sysctl_dual_path_swap __read_mostly = 1;
 
 static int __init dual_path_swap_setup(char *str)
 {

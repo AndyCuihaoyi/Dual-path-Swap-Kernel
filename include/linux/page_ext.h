@@ -2,6 +2,7 @@
 #ifndef __LINUX_PAGE_EXT_H
 #define __LINUX_PAGE_EXT_H
 
+#include <linux/compiler.h>
 #include <linux/types.h>
 #include <linux/stacktrace.h>
 #include <linux/stackdepot.h>
@@ -58,20 +59,43 @@ struct page_group;
 
 #define MAX_PAGE_EXT_AGG_WINDOW		16
 
-/**
- * struct page_ext_agg - Dual-path swap: per-page window ring + group link.
- *
- * Lives in the page_ext tail allocated by &page_ext_agg_ops.
+struct page_ext_agg_data;
+
+/*
+ * Tail slot per PFN from struct page_ext: only a pointer.  Anonymous sampling
+ * lazily allocates &page_ext_agg_data; file pages normally stay NULL→no kmalloc.
+ * PFN recycle must pair with dual_path_page_ext_prepare_free().
  */
 struct page_ext_agg {
-	u16			window_ids[MAX_PAGE_EXT_AGG_WINDOW];
-	int			head;
-	struct page_group	*group;
+	struct page_ext_agg_data	*data;
+};
+
+/**
+ * struct page_ext_agg_data - window ring + page_group link ( kmalloc, per PFN when used).
+ */
+struct page_ext_agg_data {
+	struct page_group		*group;
+	u16				window_ids[MAX_PAGE_EXT_AGG_WINDOW];
+	int				head;
+	u16				last_kagg_win;
 };
 
 extern struct page_ext_operations page_ext_agg_ops;
 
 void page_ext_agg_reset(struct page_ext_agg *agg);
+
+void page_ext_agg_push_window(struct page_ext_agg *agg, u16 win_id);
+
+void dual_path_page_ext_prepare_free(struct page *page, unsigned int order);
+
+/* GFP_NOWAIT: safe under lru_lock / ptl; may return NULL on transient pressure. */
+struct page_ext_agg_data *page_ext_agg_ensure_data(struct page_ext_agg *agg);
+
+static inline struct page_ext_agg_data *page_ext_agg_get_data_maybe(
+	const struct page_ext_agg *agg)
+{
+	return agg ? READ_ONCE(((struct page_ext_agg *)agg)->data) : NULL;
+}
 
 static inline struct page_ext_agg *page_ext_get_agg(struct page_ext *page_ext)
 {
@@ -85,6 +109,12 @@ static inline struct page_ext_agg *lookup_page_ext_agg(const struct page *page)
 	if (!ext)
 		return NULL;
 	return page_ext_get_agg(ext);
+}
+
+#else /* !CONFIG_DUAL_PATH_SWAP */
+
+static inline void dual_path_page_ext_prepare_free(struct page *p, unsigned int o)
+{
 }
 #endif /* CONFIG_DUAL_PATH_SWAP */
 

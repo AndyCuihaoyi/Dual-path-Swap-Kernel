@@ -23,6 +23,9 @@
 #include <linux/aio.h>
 #include <linux/mm.h>
 #include <linux/swap.h>
+#ifdef CONFIG_KAGGSWAPD
+#include <linux/kaggswapd.h>
+#endif
 #include <linux/slab.h>
 #include <linux/sysctl.h>
 #include <linux/bitmap.h>
@@ -125,6 +128,17 @@ static int ten_thousand = 10000;
 #endif
 #ifdef CONFIG_PERF_EVENTS
 static int six_hundred_forty_kb = 640 * 1024;
+#endif
+#ifdef CONFIG_KAGGSWAPD
+static int sysctl_dual_path_scan_mode_max = 3;
+static int sysctl_dual_path_six_hundred_k = 600000;
+static int sysctl_dual_path_ten = 10;
+static int sysctl_miner_sim_max = 100;
+static int sysctl_miner_sim_min = 50;
+static int sysctl_miner_iv_lo = 1000;
+static int sysctl_miner_iv_hi = 36000;
+static int sysctl_miner_cluster_max = 4096;
+static int sysctl_miner_cluster_min = 33;
 #endif
 
 /* this is needed for the proc_doulongvec_minmax of vm_dirty_bytes */
@@ -2794,6 +2808,71 @@ static struct ctl_table vm_table[] = {
 		.proc_handler	= proc_dointvec_minmax,
 		.extra1		= SYSCTL_ZERO,
 		.extra2		= SYSCTL_ONE,
+	},
+#endif
+#ifdef CONFIG_KAGGSWAPD
+	{
+		.procname	= "dual_path_scan_mode",
+		.data		= &sysctl_dual_path_scan_mode,
+		.maxlen		= sizeof(sysctl_dual_path_scan_mode),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= &sysctl_dual_path_scan_mode_max,
+	},
+	{
+		.procname	= "dual_path_scan_pct",
+		.data		= &sysctl_dual_path_scan_pct,
+		.maxlen		= sizeof(sysctl_dual_path_scan_pct),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ONE,
+		.extra2		= &one_hundred,
+	},
+	{
+		.procname	= "dual_path_scan_interval_ms",
+		.data		= &sysctl_dual_path_scan_interval_ms,
+		.maxlen		= sizeof(sysctl_dual_path_scan_interval_ms),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &sysctl_dual_path_ten,
+		.extra2		= &sysctl_dual_path_six_hundred_k,
+	},
+	{
+		.procname	= "dual_path_miner_enable",
+		.data		= &sysctl_dual_path_miner_enable,
+		.maxlen		= sizeof(sysctl_dual_path_miner_enable),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
+	{
+		.procname	= "dual_path_miner_interval_ms",
+		.data		= &sysctl_dual_path_miner_interval_ms,
+		.maxlen		= sizeof(sysctl_dual_path_miner_interval_ms),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &sysctl_miner_iv_lo,
+		.extra2		= &sysctl_miner_iv_hi,
+	},
+	{
+		.procname	= "dual_path_miner_similarity_pct",
+		.data		= &sysctl_dual_path_miner_similarity_pct,
+		.maxlen		= sizeof(sysctl_dual_path_miner_similarity_pct),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &sysctl_miner_sim_min,
+		.extra2		= &sysctl_miner_sim_max,
+	},
+	{
+		.procname	= "dual_path_miner_min_cluster",
+		.data		= &sysctl_dual_path_miner_min_cluster,
+		.maxlen		= sizeof(sysctl_dual_path_miner_min_cluster),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &sysctl_miner_cluster_min,
+		.extra2		= &sysctl_miner_cluster_max,
 	},
 #endif
 #ifdef CONFIG_HUGETLB_PAGE

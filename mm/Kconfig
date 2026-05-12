@@ -681,12 +681,39 @@ config DUAL_PATH_SWAP
 	  The discrete page path reuses the compressed swap cache (Zswap);
 	  the aggregated path targets sequential I/O for cold anon groups.
 
-	  Say N unless developing this subsystem. At runtime, the feature is
-	  off until enabled via /proc/sys/vm/dual_path_swap or boot option
-	  dual_path_swap=1.
+	  Say N unless developing this subsystem. At runtime, dual_path_swap
+	  defaults to on (sysctl vm.dual_path_swap=1); turn it off with
+	  sysctl 0 or boot option dual_path_swap=0.
+	  Aggregator sampling/thread code is optional; see CONFIG_KAGGSWAPD.
 
 	  Selecting this option enables PAGE_EXTENSION and allocates extra
 	  per-page storage (see struct page_ext_agg) on top of struct page_ext.
+
+config KAGGSWAPD
+	bool "kaggswapd (aggregate anon sampling / reclaimed-group path)"
+	default y
+	depends on DUAL_PATH_SWAP
+	help
+	  Builds mm/kaggswapd.c: periodic anon LRU sampling into page_ext_agg,
+	  and is the umbrella file for miner + aggregated LRU linkage work.
+	  At runtime scanning still respects dual_path_swap (see sysctl
+	  dual_path_swap and dual_path_swap= kernel parameter).
+
+	  When disabled, Dual-path Swap page_ext_agg and sysctl knobs remain if
+	  DUAL_PATH_SWAP=y, without the kaggswapd kernel thread.
+
+	  Sampling controls live under /proc/sys/vm/: dual_path_scan_mode,
+	  dual_path_scan_pct, dual_path_scan_interval_ms.
+
+config KAGGSWAPD_DEBUG
+	bool "kaggswapd debug statistics (debugfs)"
+	depends on KAGGSWAPD && DEBUG_FS
+	default y
+	help
+	  Creates /sys/kernel/debug/kaggswapd/summary: scan counters plus a
+	  small ring of recently stamped PFNs with page_ext_agg (window_ids,
+	  head, last_kagg_win). Slight overhead on each successful stamp while
+	  enabled. Defaults to on for this tree; set to N to trim hot-path cost.
 
 config ZPOOL
 	tristate "Common API for compressed memory storage"

@@ -62,6 +62,9 @@
 #include <linux/sched/rt.h>
 #include <linux/sched/mm.h>
 #include <linux/page_owner.h>
+#ifdef CONFIG_DUAL_PATH_SWAP
+#include <linux/page_ext.h>
+#endif
 #include <linux/kthread.h>
 #include <linux/memcontrol.h>
 #include <linux/ftrace.h>
@@ -1219,6 +1222,9 @@ static __always_inline bool free_pages_prepare(struct page *page,
 		if (memcg_kmem_enabled() && PageKmemcg(page))
 			__memcg_kmem_uncharge_page(page, order);
 		reset_page_owner(page, order);
+#ifdef CONFIG_DUAL_PATH_SWAP
+		dual_path_page_ext_prepare_free(page, order);
+#endif
 		return false;
 	}
 
@@ -1256,6 +1262,9 @@ static __always_inline bool free_pages_prepare(struct page *page,
 	page_cpupid_reset_last(page);
 	page->flags &= ~PAGE_FLAGS_CHECK_AT_PREP;
 	reset_page_owner(page, order);
+#ifdef CONFIG_DUAL_PATH_SWAP
+	dual_path_page_ext_prepare_free(page, order);
+#endif
 
 	if (!PageHighMem(page)) {
 		debug_check_no_locks_freed(page_address(page),
