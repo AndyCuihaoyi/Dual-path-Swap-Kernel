@@ -4,6 +4,7 @@
 
 #include <linux/compiler.h>
 #include <linux/types.h>
+#include <linux/list.h>
 #include <linux/stacktrace.h>
 #include <linux/stackdepot.h>
 
@@ -63,18 +64,22 @@ struct page_ext_agg_data;
 
 /*
  * Tail slot per PFN from struct page_ext: only a pointer.  Anonymous sampling
- * lazily allocates &page_ext_agg_data; file pages normally stay NULL→no kmalloc.
- * PFN recycle must pair with dual_path_page_ext_prepare_free().
+ * lazily allocates page_ext_agg_data from a kmem_cache; untouched pages keep
+ * data == NULL (no slab object).  PFN recycle must pair with
+ * dual_path_page_ext_prepare_free().
  */
 struct page_ext_agg {
 	struct page_ext_agg_data	*data;
 };
 
 /**
- * struct page_ext_agg_data - window ring + page_group link ( kmalloc, per PFN when used).
+ * struct page_ext_agg_data - ring + group link + intrusive miner hash node.
+ *
+ * The miner uses miner_node for in-place bucket chaining (no extra allocation).
  */
 struct page_ext_agg_data {
 	struct page_group		*group;
+	struct hlist_node		miner_node;
 	u16				window_ids[MAX_PAGE_EXT_AGG_WINDOW];
 	int				head;
 	u16				last_kagg_win;
@@ -88,8 +93,49 @@ void page_ext_agg_push_window(struct page_ext_agg *agg, u16 win_id);
 
 void dual_path_page_ext_prepare_free(struct page *page, unsigned int order);
 
-/* GFP_NOWAIT: safe under lru_lock / ptl; may return NULL on transient pressure. */
-struct page_ext_agg_data *page_ext_agg_ensure_data(struct page_ext_agg *agg);
+/**
+ * Lock-free slab install after page_ext_agg_ensure_data() inline READ_ONCE misses.
+ *
+ * Calling context may hold pgdat->lru_lock or page-table PTL — must remain
+ * non-blocking: kmem_cache allocator flags must stay GFP_NOWAIT (or equivalently
+ * GFP_ATOMIC-type); never GFP_KERNEL or direct reclaim can deadlock.
+ * Concurrent installers on the same @agg are serialized by cmpxchg on &agg->data.
+ *
+ * Implemented in mm/page_ext.c (only declaration lives here).
+ */
+struct page_ext_agg_data *__page_ext_agg_ensure_slow(struct page_ext_agg *agg);
+
+/* Fast path inlined here; misses call __page_ext_agg_ensure_slow(). */
+static inline struct page_ext_agg_data *page_ext_agg_ensure_data(
+	struct page_ext_agg *agg)
+{
+	struct page_ext_agg_data *d;
+
+	if (!agg)
+		return NULL;
+	d = READ_ONCE(agg->data);
+	if (likely(d))
+		return d;
+	return __page_ext_agg_ensure_slow(agg);
+}
+
+/**
+ * Append @win_id to ring — @d must be non-NULL (callers gate via ensure_data).
+ */
+static inline void page_ext_agg_push_window_into(struct page_ext_agg_data *d,
+						 u16 win_id)
+{
+	int i;
+
+	if (!d)
+		return;
+	i = READ_ONCE(d->head);
+	d->window_ids[i] = win_id;
+	i++;
+	if (unlikely(i >= MAX_PAGE_EXT_AGG_WINDOW))
+		i = 0;
+	WRITE_ONCE(d->head, i);
+}
 
 static inline struct page_ext_agg_data *page_ext_agg_get_data_maybe(
 	const struct page_ext_agg *agg)

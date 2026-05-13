@@ -21,27 +21,39 @@ Dual-path Swap 项目概述
 - Kconfig：``CONFIG_DUAL_PATH_SWAP``（``mm/Kconfig``），依赖 ``ZSWAP``，并 ``select PAGE_EXTENSION``；帮助文字说明了运行时可由 sysctl/启动参数关闭及扩展开销来源。
 - 每页扩展：``PAGE_EXTENSION`` tail 中为 ``struct page_ext_agg``，**当前实现仅放一个指针**
   ``struct page_ext_agg_data *data``（``include/linux/page_ext.h``）。真正记账结构
-  ``struct page_ext_agg_data``（``window_ids[]``、``head``、``last_kagg_win``、``group``）
-  在 **首次采样需要写窗** 时由 ``page_ext_agg_ensure_data()`` 以 ``kzalloc``
-  （``GFP_NOWAIT | __GFP_NOWARN``，因在 ``lru_lock`` / PTE ``ptl`` 下可能被调用）
-  **按需分配**；未盖章的文件页与普通匿名页在未写入前 ``data`` 指针为空，不占堆块。
+  ``struct page_ext_agg_data``（``window_ids[]``、``head``、``last_kagg_win``、``group``、
+  ``miner_node``）
+  在 **首次采样需要写窗** 时：头文件内联 ``page_ext_agg_ensure_data()`` 先用 ``READ_ONCE`` 快路径，
+  未命中则 ``__page_ext_agg_ensure_slow()`` 以 ``GFP_NOWAIT | __GFP_NOWARN`` 从 kmem_cache
+  ``page_ext_agg_data`` 取零对象并以 ``cmpxchg`` **无锁挂载**；未盖章页 ``data`` 为空。
   PFN 归还时在 ``mm/page_alloc.c`` 的 ``free_pages_prepare()``（``reset_page_owner`` 之后）
-  调用 ``dual_path_page_ext_prepare_free()``，对 ``page + i`` 做 ``lookup_page_ext_agg``、``xchg`` 清指针并 ``kfree``，避免 PFN 复用脏数据泄漏（``mm/page_ext.c``）。
+  调用 ``dual_path_page_ext_prepare_free()``，对 ``page + i`` 做 ``lookup_page_ext_agg``、``xchg`` 清指针并 ``kmem_cache_free``，避免 PFN 复用脏数据泄漏（``mm/page_ext.c``）。
   ``page_ext_agg_ops`` 的 ``size`` 现为 ``sizeof(struct page_ext_agg)``（指针大小）。
   挂上 ``group`` 后须在释放路径前摘除，否则 ``prepare_free`` 会 ``WARN_ON_ONCE``。
 - 聚合 LRU：``struct lruvec`` 增加 ``agg_list``；``struct page_group`` 及 ``lruvec_page_group_*`` 链表操作（``include/linux/mmzone.h``、``mm/mmzone.c``）；需在持 ``lru_lock`` 下操作（见注释与 ``lockdep_assert_held``）。
 - 运行时总开关：本树默认 **开启** Dual-path（``sysctl_dual_path_swap`` 初值为 1，见 ``mm/swap.c``）；仍可通过启动参数 ``dual_path_swap=0`` 或 ``sysctl -w vm.dual_path_swap=0`` 关闭。``include/linux/swap.h`` 中 ``dual_path_swap_enabled()`` 供各路径判断（未开启 CONFIG 时恒为 false）。
 - 聚合线程与采样（可按配置裁掉）：``CONFIG_KAGGSWAPD`` 对应 ``mm/kaggswapd.c`` / ``include/linux/kaggswapd.h``；内核线程名为 ``kaggswapd``，通过 ``vm.dual_path_scan_mode``、``dual_path_scan_pct``、``dual_path_scan_interval_ms`` 调度多种 LRU 扫描策略并把窗口 ID 写入 **按需存在的** ``page_ext_agg_data``（经 ``lookup_page_ext_agg`` + ``ensure_data``）。
+- Miner 周期器：``vm.dual_path_miner_enable=1`` 时按 ``vm.dual_path_miner_interval_ms`` 触发；每轮从 ``LRU_INACTIVE_ANON`` 按 ``vm.dual_path_scan_pct`` 比例确定“视野”上限（受 ``KAGG_MINER_VIEW_MAX`` 保护），随后以 ``KAGG_MINER_BATCH_MAX`` 小批次循环执行“隔离 -> 分桶”并在桶中累积候选页（侵入式 ``miner_node``，零额外分配），最后按 ``vm.dual_path_miner_similarity_pct`` 做贪心聚类，达到 ``vm.dual_path_miner_min_cluster`` 的簇生成 ``page_group`` 元数据挂入 ``lruvec->agg_list``，并统一 ``putback_lru_page``。扫描游标采用按 node 持久化游标（``kagg_miner_cursor_pfn`` / ``kagg_miner_cursor_valid``）持续推进，避免每轮都从链表头重复扫描。
 
 - 调试统计：``CONFIG_KAGGSWAPD_DEBUG``（``mm/Kconfig``，本树 **默认 y**）在 ``debugfs`` 下提供 ``kaggswapd/summary``；依赖 ``CONFIG_DEBUG_FS``。详见下文「调试方式」。
 
 尚未接入或待实现（与方案文档对应的主线）：
 
 - 定时器驱动的页表遍历（与当前 LRU 采样式 ``kagg_*`` API 并行存在时的策略取舍）。
-- Pattern Miner：热冷过滤、指纹分桶、相似度聚类、将页移入/移出 ``agg_list`` 及 ``page_list`` 维护（计划继续落在 ``kaggswapd.c`` 中）。
+- Pattern Miner：已接入“隔离+哈希分桶+桶内贪心相似度聚类+page_group 元数据入 ``agg_list``+回填”；仍待接入按页成员链维护、下刷队列与 Swap I/O 执行路径（计划继续落在 ``kaggswapd.c`` / reclaim 主路径）。
 - ``mm/vmscan.c`` / Swap 路径：在 ``dual_path_swap_enabled()`` 下对离散路径与聚合路径的分流，以及与 Zswap、底层 swap 设备的协同。
 - Multi-Order Swap 簇分配器、聚合路径与 Swap 栈深度对接，以及聚合换入/预取与「防污染」页状态策略。
 - 测试与文档：自测用例、``Documentation/`` 或模块说明（若需对外维护）。
+
+扫描语义分层（采样 vs 挖掘）
+----------------------------
+
+- 采样扫描（Sampling / Stamping）：目标是写 ``window_ids`` 与 ``last_kagg_win``，产出访问特征。
+  - 采样-LRU：逐页扫描并打标记。
+  - 采样-VMA：从 Inactive anon 尾部按 ``vm.dual_path_scan_pct`` 比例取 seed（带上限保护），经 RMAP 找 VMA 并遍历页表，对关联匿名页打标。
+- 挖掘扫描（Mining / Clustering）：目标是将高相似度页面成团（``page_group``）。
+  - 挖掘-LRU：批次隔离页面，分桶并聚类，满足阈值后生成 ``page_group`` 元数据并挂 ``agg_list``。
+  - 挖掘-VMA：以 seed 为中心，通过 RMAP 拉取 VMA 匿名页并做相似度比对（待完整接入）。
 
 运行时 sysctl 与启动参数（快速参考）
 ------------------------------------
@@ -49,8 +61,8 @@ Dual-path Swap 项目概述
 前提：内核需 ``CONFIG_DUAL_PATH_SWAP=y``；采样相关项还需 ``CONFIG_KAGGSWAPD=y``。节点位于 ``/proc/sys/vm/``。
 
 - ``vm.dual_path_swap``：**本树默认 1**，取值 0 或 1；总开关。为 0 时 ``kaggswapd`` 不推进扫描，仅在低功耗轮询中睡眠等待。
-- ``vm.dual_path_scan_mode``：**默认 0**，合法范围 0–3：0 Inactive anon 前 ``pct%``；1 Active 前 ``pct%``；2 全 inactive + active anon（忽略 ``pct``）；3 Inactive 前缀作 seed，经 rmap 与 VMA 页表遍历展开。
-- ``vm.dual_path_scan_pct``：**默认 30**，合法 1–100；用于 mode 0、1、3 的bounded 扫描上限比例。
+- ``vm.dual_path_scan_mode``：**默认 0**，合法范围 0–3：0 Inactive anon 前 ``pct%``；1 Active 前 ``pct%``；2 全 inactive + active anon（忽略 ``pct``）；3 从 Inactive anon 尾部按 ``pct%`` 取 seed，经 RMAP 与 VMA 页表遍历展开。
+- ``vm.dual_path_scan_pct``：**默认 30**，合法 1–100；用于 mode 0、1 的 bounded 扫描比例，mode 3 的 seed 选取比例，以及 miner 的“每轮视野目标”比例（最终受 ``KAGG_MINER_VIEW_MAX`` 与 ``KAGG_MINER_BATCH_MAX`` 的分层上限约束）。
 - ``vm.dual_path_scan_interval_ms``：**默认 100**，合法 10–600000；每轮「所有在线 NUMA node 采样」结束后的休眠毫秒数。
 
 常用命令示例（查看与写入）::
@@ -79,13 +91,24 @@ Dual-path Swap 项目概述
 - ``scan_rounds``：总开关开启时，每完成一轮全 node 采样递增。
 - ``pages_stamped``：成功向 ``page_ext_agg_data``（经 ``push_window``）推入新 window 的次数。
 - ``dedup_same_window``：同一采样窗口内因 ``page_ext_agg_data::last_kagg_win`` 去重跳过次数。
+- ``miner_rounds``：矿工周期成功执行的轮次（按 ``dual_path_miner_enable`` 与 interval）。
+- ``miner_isolated_pages``：矿工从 Inactive anon 隔离到本地链表的页数累计。
+- ``miner_clusters_emitted`` / ``miner_cluster_pages``：达到阈值并产出的 ``page_group`` 数量与页数累计。
+- ``miner_putback_pages``：矿工处理后回填到 LRU 的页数累计。
+- ``miner_groups_cleared``：预留统计（当前策略不在每轮前清空 ``agg_list``，该值通常为 0）。
+- ``mem_total_pages``：系统当前可管理的总内存页数（``totalram_pages()``）。
+- ``mem_anon_active_pages``：系统匿名 Active LRU 页数（``NR_ACTIVE_ANON``）。
+- ``mem_anon_inactive_pages``：系统匿名 Inactive LRU 页数（``NR_INACTIVE_ANON``）。
 - ``next_win_id``：全局 u16 窗口号的无锁窥探，可能与实际略有竞态。
+- ``agg_groups_per_node``：各 node 当前 ``agg_list`` 的 group 数与聚合页计数快照（best-effort）。
 - ``recent_stamped_pfns``：最近记录的 PFN 与 ``head``、``last_win``、环形 ``window_ids[]``、``group``；
   若该行显示 ``no_agg_data``，表示 **该 PFN 尚未分配** ``page_ext_agg_data``（例如仅出现在调试环中但首轮分配因 ``GFP_NOWAIT`` 失败等）；调试用快照，不保序与强一致性。
 
 若需去掉盖章路径上的计数与环形缓冲区开销，在配置中将 ``CONFIG_KAGGSWAPD_DEBUG`` 置为 ``n``（``make menuconfig`` → ``Memory Management options`` → ``kaggswapd debug statistics (debugfs)``）。
 
 构建提示：启用 ``ZSWAP``、``DUAL_PATH_SWAP``；采样线程默认 ``CONFIG_KAGGSWAPD=y``。整编并启动本树内核后，**无需再手动 sysctl 打开** 即可执行聚合采样路径（除非你用启动参数或 sysctl 关掉总开关）。
+
+参数快速下发：仓库根目录提供 ``kaggswapd_tune.sh``，用于开机后一次性写入关键 ``vm.dual_path_*`` 参数并读取 ``debugfs`` 汇总，便于复现实验配置与回归对比。
 
 
 ------------------------------------------------------------------------
@@ -111,7 +134,10 @@ the problems which may result by upgrading your kernel.
 
 问题记录
 
-0. （2026-05 更新）**page_ext_agg 懒分配与释放**：tail 仅存指针槽；采样首次写窗时分配 ``page_ext_agg_data``；
-   页面释放在 ``free_pages_prepare`` 中统一回收 kmalloc；分配使用 ``GFP_NOWAIT`` 以适应持锁上下文。
+0. （2026-05 更新）**page_ext_agg 懒分配与释放**：tail 仅存指针槽；采样首次写窗 kmem_cache_zalloc；
+   页面释放在 ``free_pages_prepare`` 中 ``kmem_cache_free``；快路径在内联 ``page_ext_agg_ensure_data()`` 中为 ``READ_ONCE`` 命中，
+   ``GFP_NOWAIT`` 慢路径挂载使用 ``cmpxchg``。
 
 1. 下一步我们要对匿名页进行挖掘，单独设置一个计时器进行周期性挖掘（这个周期需要远大于扫描周期），进行挖掘时理论上扫描的页面和我们采样时扫描的页面是一致的，但是由于两个动作的周期不一致，比如说我们打标记的页会晋升或者降级；所以除了每次都扫描全局匿名页的模式，我们在管理生命周期的方法上还需要考虑一下。
+
+2. （2026-05 稳定性排障）miner enable 后出现 RCU stall 的根因是：早期实现在持有 ``pgdat->lru_lock`` 时调用了 ``isolate_lru_page()``。该接口在 ``mm/vmscan.c`` 的约束明确要求调用方不得持有 ``lru_lock``（其内部会自行加锁），违背调用契约会导致长时间锁阻塞与调度停滞，最终触发 ``rcu_sched detected stalls``。修复原则：锁内仅做轻量遍历/取引用，隔离与重计算放到锁外执行，并配合分段 ``cond_resched()``。

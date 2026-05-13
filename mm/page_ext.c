@@ -8,6 +8,7 @@
 #include <linux/kmemleak.h>
 #include <linux/slab.h>
 #include <linux/atomic.h>
+#include <linux/list.h>
 #include <linux/page_owner.h>
 #include <linux/page_idle.h>
 
@@ -62,31 +63,48 @@
 
 #ifdef CONFIG_DUAL_PATH_SWAP
 
-struct page_ext_agg_data *page_ext_agg_ensure_data(struct page_ext_agg *agg)
+static struct kmem_cache *page_ext_agg_data_cache __read_mostly;
+
+static void __init page_ext_agg_slab_init(void)
+{
+	page_ext_agg_data_cache = kmem_cache_create("page_ext_agg_data",
+			sizeof(struct page_ext_agg_data), 0,
+			SLAB_HWCACHE_ALIGN, NULL);
+	BUG_ON(!page_ext_agg_data_cache);
+}
+
+/*
+ * __page_ext_agg_ensure_slow - install page_ext_agg_data (see page_ext.h red lines).
+ *
+ * Must not sleep: caller may hold LRU or PTL spinlocks.  Only GFP_NOWAIT on the
+ * kmem_cache path.  Concurrent CPUs use cmpxchg(&agg->data, NULL, alloc).
+ */
+struct page_ext_agg_data *__page_ext_agg_ensure_slow(struct page_ext_agg *agg)
 {
 	struct page_ext_agg_data *alloc, *old;
-
-	if (!agg)
-		return NULL;
 
 	alloc = READ_ONCE(agg->data);
 	if (alloc)
 		return alloc;
 
-	/*
-	 * Callers (kaggswapd) run under pgdat->lru_lock or PTE page table lock;
-	 * must not use GFP_KERNEL here.
-	 */
-	alloc = kzalloc(sizeof(*alloc), GFP_NOWAIT | __GFP_NOWARN);
+	alloc = kmem_cache_zalloc(page_ext_agg_data_cache,
+				  GFP_NOWAIT | __GFP_NOWARN);
 	if (!alloc)
 		return NULL;
 
 	old = cmpxchg(&agg->data, NULL, alloc);
 	if (old) {
-		kfree(alloc);
+		kmem_cache_free(page_ext_agg_data_cache, alloc);
 		return old;
 	}
 	return alloc;
+}
+
+static void page_ext_agg_data_destroy(struct page_ext_agg_data *data)
+{
+	WARN_ON_ONCE(data->group);
+	hlist_del_init(&data->miner_node);
+	kmem_cache_free(page_ext_agg_data_cache, data);
 }
 
 void page_ext_agg_reset(struct page_ext_agg *agg)
@@ -98,8 +116,7 @@ void page_ext_agg_reset(struct page_ext_agg *agg)
 	data = xchg(&agg->data, NULL);
 	if (!data)
 		return;
-	WARN_ON_ONCE(data->group);
-	kfree(data);
+	page_ext_agg_data_destroy(data);
 }
 
 /*
@@ -109,16 +126,10 @@ void page_ext_agg_reset(struct page_ext_agg *agg)
 void page_ext_agg_push_window(struct page_ext_agg *agg, u16 win_id)
 {
 	struct page_ext_agg_data *d = page_ext_agg_ensure_data(agg);
-	int i;
 
 	if (!d)
 		return;
-	i = d->head;
-	d->window_ids[i] = win_id;
-	i++;
-	if (i >= MAX_PAGE_EXT_AGG_WINDOW)
-		i = 0;
-	d->head = i;
+	page_ext_agg_push_window_into(d, win_id);
 }
 
 void dual_path_page_ext_prepare_free(struct page *page, unsigned int order)
@@ -134,8 +145,7 @@ void dual_path_page_ext_prepare_free(struct page *page, unsigned int order)
 		data = xchg(&agg->data, NULL);
 		if (!data)
 			continue;
-		WARN_ON_ONCE(data->group);
-		kfree(data);
+		page_ext_agg_data_destroy(data);
 	}
 }
 
@@ -145,8 +155,9 @@ static bool page_ext_agg_need(void)
 }
 
 struct page_ext_operations page_ext_agg_ops = {
-	.size = sizeof(struct page_ext_agg),
-	.need = page_ext_agg_need,
+	.size	= sizeof(struct page_ext_agg),
+	.need	= page_ext_agg_need,
+	.init	= page_ext_agg_slab_init,
 };
 
 #endif /* CONFIG_DUAL_PATH_SWAP */
