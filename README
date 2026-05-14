@@ -13,7 +13,7 @@ Dual-path Swap 项目概述
 
 配套机制包括：基于时间窗与页表 Accessed/Young 位的轻量采集、Transaction ID 环形缓冲、指纹相似度与分桶挖掘、专用线程（设计稿中为 kaggswapd）与现有 kswapd 分工等。详细设计与实验数据见仓库内 ``.cursor/context/`` 下可行性报告等文档；编码约定见 ``.cursorrules``。
 
-当前代码进度（同步点，约 2026-05）
+当前代码进度（同步点，2026-05 延续）
 ---------------------------------
 
 已具备（编译与数据骨架）：
@@ -33,8 +33,10 @@ Dual-path Swap 项目概述
 - 聚合 LRU：``struct lruvec`` 增加 ``agg_list``；``struct page_group`` 及 ``lruvec_page_group_*`` 链表操作（``include/linux/mmzone.h``、``mm/mmzone.c``）；需在持 ``lru_lock`` 下操作（见注释与 ``lockdep_assert_held``）。
 - 运行时总开关：本树默认 **开启** Dual-path（``sysctl_dual_path_swap`` 初值为 1，见 ``mm/swap.c``）；仍可通过启动参数 ``dual_path_swap=0`` 或 ``sysctl -w vm.dual_path_swap=0`` 关闭。``include/linux/swap.h`` 中 ``dual_path_swap_enabled()`` 供各路径判断（未开启 CONFIG 时恒为 false）。
 - 聚合线程与采样（可按配置裁掉）：``CONFIG_KAGGSWAPD`` 对应 ``mm/kaggswapd.c`` / ``include/linux/kaggswapd.h``；内核线程名为 ``kaggswapd``，通过 ``vm.dual_path_scan_mode``、``dual_path_scan_pct``、``dual_path_scan_interval_ms`` 调度多种 LRU 扫描策略并把窗口 ID 写入 **按需存在的** ``page_ext_agg_data``（经 ``lookup_page_ext_agg`` + ``ensure_data``）。
-- Miner 周期器：``vm.dual_path_miner_enable=1`` 时按 ``vm.dual_path_miner_interval_ms`` 触发；每轮从 ``LRU_INACTIVE_ANON`` 按 ``vm.dual_path_scan_pct`` 比例确定“视野”上限（受 ``KAGG_MINER_VIEW_MAX`` 保护），随后以 ``KAGG_MINER_BATCH_MAX`` 小批次循环执行“隔离 -> 分桶”并在桶中累积候选页（侵入式 ``miner_node``，零额外分配），最后按 ``vm.dual_path_miner_similarity_pct`` 做贪心聚类，达到 ``vm.dual_path_miner_min_cluster`` 的簇生成 ``page_group`` 元数据挂入 ``lruvec->agg_list``，并统一 ``putback_lru_page``。扫描游标采用按 node 持久化游标（``kagg_miner_cursor_pfn`` / ``kagg_miner_cursor_valid``）持续推进，避免每轮都从链表头重复扫描。
-
+- Miner 周期器：``vm.dual_path_miner_enable=1`` 时按 ``vm.dual_path_miner_interval_ms`` 触发；对每个在线 NUMA node、再对每个在线 ``mem_cgroup`` 的 ``lruvec``，从 ``LRU_INACTIVE_ANON`` 按 ``vm.dual_path_scan_pct`` 比例确定“视野”上限（受 ``KAGG_MINER_VIEW_MAX`` 保护），随后以 ``KAGG_MINER_BATCH_MAX`` 小批次循环执行“隔离 -> 分桶”并在桶中累积候选页（侵入式 ``miner_node``），最后按 ``vm.dual_path_miner_similarity_pct`` 做贪心聚类，达到 ``vm.dual_path_miner_min_cluster`` 的簇生成 ``page_group`` 元数据挂入 **该 ``lruvec``** 的 ``agg_list``，并统一 ``putback_lru_page``。挖掘 LRU 游标按 **``memcg_id`` + node** 记录在 ``struct kagg_memcg_meta::cursor_lru_steps[]``（见 ``mm/kaggswapd.c``），避免不同 cgroup 共享同一 node 游标。
+- **per-memcg 元数据生命周期**：``kagg_memcg_meta_get()`` 对非根 ``memcg_id`` 在哈希表中 ``kzalloc`` 的 ``struct kagg_memcg_meta``，在 ``mm/memcontrol.c`` 的 ``mem_cgroup_css_offline()`` 中、``mem_cgroup_id_put()`` **之前**调用 ``kagg_memcg_meta_free()``（``include/linux/kaggswapd.h`` 声明）摘除节点并 ``kfree``，避免 Docker/K8s 场景下 **memcg_id 复用** 与 **slab 泄漏**；根 memcg（id 0）仍使用静态 ``kagg_root_meta``，不经过该释放路径。
+- **相似度计算微结构**：``kagg_windows_unique()`` 对环形窗内去重后的 ``u16`` 窗口 ID 做插入排序；``kagg_miner_similar()`` 对两有序序列用 **双指针** 求交集，单次比较上界 ``O(MAX_PAGE_EXT_AGG_WINDOW)`` 量级（``MAX_PAGE_EXT_AGG_WINDOW=16``）。
+- **VMA 展开采样**：``kagg_scan_inactive_vma_expand`` 在将 seed 压入 ``kagg_vma_seed_buf`` 前增加 ``page_mapped(page)`` 判断，跳过已无 PTE 映射的页，减少 ``page_get_anon_vma`` / ``walk_page_vma`` 空转。
 - 调试统计：``CONFIG_KAGGSWAPD_DEBUG``（``mm/Kconfig``，本树 **默认 y**）在 ``debugfs`` 下提供 ``kaggswapd/summary``；依赖 ``CONFIG_DEBUG_FS``。详见下文「调试方式」。
 
 尚未接入或待实现（与方案文档对应的主线）：
@@ -50,7 +52,7 @@ Dual-path Swap 项目概述
 
 - 采样扫描（Sampling / Stamping）：目标是写 ``window_ids`` 与 ``last_kagg_win``，产出访问特征。
   - 采样-LRU：逐页扫描并打标记。
-  - 采样-VMA：从 Inactive anon 尾部按 ``vm.dual_path_scan_pct`` 比例取 seed（带上限保护），经 RMAP 找 VMA 并遍历页表，对关联匿名页打标。
+  - 采样-VMA：从 Inactive anon 尾部按 ``vm.dual_path_scan_pct`` 比例取 seed（带上限保护）；仅 ``page_mapped`` 的 seed 入队，经 RMAP 找 VMA 并 ``walk_page_vma``，对关联匿名页打标。
 - 挖掘扫描（Mining / Clustering）：目标是将高相似度页面成团（``page_group``）。
   - 挖掘-LRU：批次隔离页面，分桶并聚类，满足阈值后生成 ``page_group`` 元数据并挂 ``agg_list``。
   - 挖掘-VMA：以 seed 为中心，通过 RMAP 拉取 VMA 匿名页并做相似度比对（待完整接入）。
@@ -64,10 +66,14 @@ Dual-path Swap 项目概述
 - ``vm.dual_path_scan_mode``：**默认 0**，合法范围 0–3：0 Inactive anon 前 ``pct%``；1 Active 前 ``pct%``；2 全 inactive + active anon（忽略 ``pct``）；3 从 Inactive anon 尾部按 ``pct%`` 取 seed，经 RMAP 与 VMA 页表遍历展开。
 - ``vm.dual_path_scan_pct``：**默认 30**，合法 1–100；用于 mode 0、1 的 bounded 扫描比例，mode 3 的 seed 选取比例，以及 miner 的“每轮视野目标”比例（最终受 ``KAGG_MINER_VIEW_MAX`` 与 ``KAGG_MINER_BATCH_MAX`` 的分层上限约束）。
 - ``vm.dual_path_scan_interval_ms``：**默认 100**，合法 10–600000；每轮「所有在线 NUMA node 采样」结束后的休眠毫秒数。
+- ``vm.dual_path_miner_enable``：**默认 0**（见 ``mm/kaggswapd.c`` 初值；可通过 sysctl 置 1），合法 0–1；为 1 时按 ``dual_path_miner_interval_ms`` 周期执行挖掘平面（仍受 ``dual_path_swap`` 总开关约束）。
+- ``vm.dual_path_miner_interval_ms``：**默认 6000**，合法 1000–36000（见 ``kernel/sysctl.c`` 与 ``kaggswapd_fn`` 内 clamp）；挖掘块之间的最小间隔（毫秒）。
+- ``vm.dual_path_miner_similarity_pct``：**默认 75**，合法 50–100（见 ``kernel/sysctl.c``）；桶内 ``kagg_miner_similar`` 判定阈值（百分比，交集相对较大集合）。``kagg_miner_cluster_and_putback`` 内另将读值 clamp 至 1–100。
+- ``vm.dual_path_miner_min_cluster``：**默认 33**，合法 33–4096（见 ``kernel/sysctl.c``）；单簇至少页数，低于则不成团并走回填。聚类路径内另 clamp 至 1–``KAGG_MINER_CLUSTER_MAX``。
 
 常用命令示例（查看与写入）::
 
-	sysctl vm.dual_path_swap vm.dual_path_scan_mode vm.dual_path_scan_pct vm.dual_path_scan_interval_ms
+	sysctl vm.dual_path_swap vm.dual_path_scan_mode vm.dual_path_scan_pct vm.dual_path_scan_interval_ms vm.dual_path_miner_enable vm.dual_path_miner_interval_ms vm.dual_path_miner_similarity_pct vm.dual_path_miner_min_cluster
 	sudo sysctl -w vm.dual_path_swap=0
 	sudo sysctl -w vm.dual_path_swap=1
 
@@ -82,27 +88,22 @@ Dual-path Swap 项目概述
 
 	sudo mount -t debugfs none /sys/kernel/debug
 
-在存在一定匿名负载且 ``vm.dual_path_swap=1`` 时，读取一页调试汇总（含若干 PFN 对应的 ``page_ext_agg`` / ``page_ext_agg_data`` 快照）::
+在存在一定匿名负载且 ``vm.dual_path_swap=1`` 时，读取调试汇总（字段以 ``mm/kaggswapd.c`` 中 ``kagg_summary_show`` 为准）::
 
 	sudo cat /sys/kernel/debug/kaggswapd/summary
 
 ``summary`` 中主要字段：
 
-- ``scan_rounds``：总开关开启时，每完成一轮全 node 采样递增。
-- ``pages_stamped``：成功向 ``page_ext_agg_data``（经 ``push_window``）推入新 window 的次数。
-- ``dedup_same_window``：同一采样窗口内因 ``page_ext_agg_data::last_kagg_win`` 去重跳过次数。
-- ``miner_rounds``：矿工周期成功执行的轮次（按 ``dual_path_miner_enable`` 与 interval）。
-- ``miner_isolated_pages``：矿工从 Inactive anon 隔离到本地链表的页数累计。
-- ``miner_clusters_emitted`` / ``miner_cluster_pages``：达到阈值并产出的 ``page_group`` 数量与页数累计。
-- ``miner_putback_pages``：矿工处理后回填到 LRU 的页数累计。
-- ``miner_groups_cleared``：预留统计（当前策略不在每轮前清空 ``agg_list``，该值通常为 0）。
-- ``mem_total_pages``：系统当前可管理的总内存页数（``totalram_pages()``）。
-- ``mem_anon_active_pages``：系统匿名 Active LRU 页数（``NR_ACTIVE_ANON``）。
-- ``mem_anon_inactive_pages``：系统匿名 Inactive LRU 页数（``NR_INACTIVE_ANON``）。
+- ``=== 系统概况 ===``：全局内存与 **memcg**：``memcg_summary(total/online/hierarchy/max_depth)`` 一行汇总（``memcg_total`` / ``memcg_online`` / ``use_hierarchy`` / ``memcg_max_depth``）。随后 ``memcg_top10``：一行英文说明（``group_size`` 列对应 ``clusters_emitted``、``clustered_pages`` 对应 ``cluster_pages``、无 per-memcg meta 时后三项为 0）。与 ``memcg_summary`` 计数共用 **一次** ``mem_cgroup_iter`` 全树遍历，边遍历边将各行写入按需倍增的 ``kvmalloc`` 表；再按 ``group_size`` **降序** 排序（``group_size`` 相同则 ``clustered_pages`` 降序，再按 ``memcg_id`` 升序），输出 **前 10** 行；表分配失败或中途失败时打印 ``memcg_top10(alloc_failed or incomplete…)``（若已有部分行仍会排序输出）。每行形如 ``memcg_id=…``（**不含** cgroup 路径名）。**不再**输出整棵 ``memcg_tree``。
+- ``scan_rounds`` / ``pages_stamped`` / ``dedup_same_window``：采样侧累计。
+- ``=== 挖掘核心统计 ===``：``miner_rounds``、``miner_isolated_pages``、``miner_view_target_pages``。**不再**在 ``summary`` 中打印 chunk 级 ``miner_iso_tail`` / ``miner_iso_quota``；隔离凑批的调试计数（``kagg_dbg_miner_iso_*``）仍在代码路径中累加，供后续扩展 trace 或单独导出。
+- ``=== 聚类结果 ===``：``miner_clusters_emitted``、``miner_cluster_pages``、``miner_putback_pages``、``miner_groups_cleared``、``miner_members_linked``、``miner_bucket_trunc`` 等。
+- ``=== 聚合组概览 ===``：跨 node、跨 memcg 的 ``agg_list`` 汇总（best-effort）。
 - ``next_win_id``：全局 u16 窗口号的无锁窥探，可能与实际略有竞态。
-- ``agg_groups_per_node``：各 node 当前 ``agg_list`` 的 group 数与聚合页计数快照（best-effort）。
-- ``recent_stamped_pfns``：最近记录的 PFN 与 ``head``、``last_win``、环形 ``window_ids[]``、``group``；
-  若该行显示 ``no_agg_data``，表示 **该 PFN 尚未分配** ``page_ext_agg_data``（例如仅出现在调试环中但首轮分配因 ``GFP_NOWAIT`` 失败等）；调试用快照，不保序与强一致性。
+
+**采样打标路径注意**：``kagg_try_mark_window`` 侧对 ``pfn_valid``、``READ_ONCE(agg->data)==d`` 及 ``page_ext_agg_push_window_into`` 中 ``head`` 钳位等防护，见「问题记录」2b；``kagg_scan_lru_bounded`` 在 ``get_page`` 成功后 ``smp_mb()`` 再释放 ``lru_lock``，减轻与 ``dual_path_page_ext_prepare_free`` 的乱序竞态。
+
+**不再**在 ``summary`` 中逐 memcg 打印完整挖掘列表；分桶截断与 memcg 粒度的量化分析见「问题记录」第 3 条。
 
 若需去掉盖章路径上的计数与环形缓冲区开销，在配置中将 ``CONFIG_KAGGSWAPD_DEBUG`` 置为 ``n``（``make menuconfig`` → ``Memory Management options`` → ``kaggswapd debug statistics (debugfs)``）。
 
@@ -141,3 +142,27 @@ the problems which may result by upgrading your kernel.
 1. 下一步我们要对匿名页进行挖掘，单独设置一个计时器进行周期性挖掘（这个周期需要远大于扫描周期），进行挖掘时理论上扫描的页面和我们采样时扫描的页面是一致的，但是由于两个动作的周期不一致，比如说我们打标记的页会晋升或者降级；所以除了每次都扫描全局匿名页的模式，我们在管理生命周期的方法上还需要考虑一下。
 
 2. （2026-05 稳定性排障）miner enable 后出现 RCU stall 的根因是：早期实现在持有 ``pgdat->lru_lock`` 时调用了 ``isolate_lru_page()``。该接口在 ``mm/vmscan.c`` 的约束明确要求调用方不得持有 ``lru_lock``（其内部会自行加锁），违背调用契约会导致长时间锁阻塞与调度停滞，最终触发 ``rcu_sched detected stalls``。修复原则：锁内仅做轻量遍历/取引用，隔离与重计算放到锁外执行，并配合分段 ``cond_resched()``。
+
+2b. （2026-05 稳定性）采样路径 ``kagg_scan_lru_bounded`` 在 ``get_page_unless_zero`` 之后释放 ``lru_lock`` 再调用 ``kagg_try_mark_window``；若与 ``dual_path_page_ext_prepare_free`` 存在极端竞态，可能出现对已释放 ``page_ext_agg_data`` 的解引用（``kagg_try_mark_window+0x54`` 类页故障）。缓解：``pfn_valid`` 门禁、``READ_ONCE(agg->data)==d`` 在访问 ``d`` 前后校验、``smp_mb()`` 保证引用计数在解锁前可见；环写入口对 ``head`` 做越界钳位（``page_ext_agg_push_window_into``）。
+
+2c. （2026-05 生产排雷）**per-memcg 元数据泄漏**：``kagg_memcg_meta_get`` 对非根 ``memcg_id`` 在 ``kagg_memcg_meta_hash`` 中 ``kzalloc`` 的 ``struct kagg_memcg_meta`` 原先无释放路径。现于 ``mm/memcontrol.c`` 的 ``mem_cgroup_css_offline()`` 中、在 ``mem_cgroup_id_put()`` **之前**调用 ``kagg_memcg_meta_free()``（``mm/kaggswapd.c`` / ``include/linux/kaggswapd.h``），摘除哈希节点并 ``kfree``，避免容器频繁创建/销毁时 ``memcg_id`` 复用与 slab 泄漏。说明：挖掘线程仅遍历 ``mem_cgroup_online`` 的 memcg，与 ``css_offline`` 的极窄竞态若需绝对消除，可后续为 meta 增加引用计数或 RCU 释放。
+
+2d. （2026-05 微优化）``kagg_windows_unique`` 对窗口 ID 做插入排序后，``kagg_miner_similar`` 用双指针求有序数组交集，将单次比较从 ``O(ns*nc)`` 降为 ``O(ns+nc)``（``MAX_PAGE_EXT_AGG_WINDOW=16`` 时上界 32）。VMA 展开路径 ``kagg_scan_inactive_vma_expand`` 在入 seed 缓冲前跳过 ``!page_mapped(page)``，避免对已无 PTE 映射的冷页做 ``page_get_anon_vma``/walk 空转。
+
+3. （2026-05 观测）**memcg 粒度与「分桶截断」指标（``miner_bucket_trunc``）**
+
+   **背景**：启用 cgroup 后，匿名页主要挂在各 ``mem_cgroup`` 的 ``lruvec`` 上；采样与挖掘已改为按 **每个在线 memcg × 每个在线 node** 的 ``lruvec`` 遍历（见 ``mm/kaggswapd.c`` 中 ``kagg_sample_scan_pgdat`` / ``kagg_miner_scan_pgdat``）。挖掘游标与部分累计统计按 **memcg_id** 单独维护（``struct kagg_memcg_meta``），避免不同 cgroup 共享同一 node 游标；**memcg 离线时** 由 ``kagg_memcg_meta_free()`` 回收对应 meta（见「问题记录」2c）。
+
+   **``miner_bucket_trunc`` 含义**：在 ``kagg_miner_cluster_and_putback`` 中，对每个哈希桶做桶内贪心聚类时，若单桶内 **seed 轮数** 超过 ``KAGG_MINER_BUCKET_SEED_MAX``（本树为 **8192**），则对该桶调用 ``kagg_miner_bucket_strip_nodes`` 并 **累计 +1**。这是 **「每桶一次触顶」** 的计数，**不是页数**；一轮挖掘内最多 **1024** 个桶（``KAGG_MINER_HASH_SIZE``），故单 memcg 单轮理论上界为 1024 次截断（实际通常远小于该值）。
+
+   **一次典型现场量化（单 NUMA、``dual_path_scan_pct=30``、miner 相似度 90%、``min_cluster=33``，``debugfs/kaggswapd/summary`` 快照）**：
+
+   - **系统**：``numa_online_nodes=1``；``mem_anon_pages=2387``（active 182 / inactive 2205）；``memcg_total=67``，``memcg_online=39``。
+   - **采样**：``scan_rounds=973``，``pages_stamped=1650007``。
+   - **挖掘（全局汇总）**：``miner_rounds=20``；``miner_isolated_pages=24091``；``miner_view_target_pages=24112``（与 ``summary`` 当前字段一致；chunk 级 ``miner_iso_*`` 已不在 ``summary`` 中打印）。
+   - **聚类（全局）**：``miner_clusters_emitted=139``；``miner_cluster_pages=12311``；``miner_putback_pages=11651``；**成团率** ``12311/24091≈51.1%``，**回填率** ``11651/24091≈48.4%``；``miner_bucket_trunc=893``（相对 20 轮全局挖掘，约 **44.7 次/轮** 的桶触顶 strip 累计，分散在多个 memcg 与多桶上）。
+   - **单 memcg 切片示例（原 summary 曾逐行打印，现已迁至本文档留存）**：``memcg_id=1`` 在同期快照中为 ``rounds=21``、``isolated=1283``、``clustered=777``、``putback=506``、``bucket_trunc=47``。其中 **47 次截断 / 21 次该 memcg 挖掘计数 ≈ 2.24 次/计数周期**，表示平均每个周期约有 **2～3 个哈希桶** 触顶，**不**等价于「21 轮里失败 47 次」或「每轮必失败」。
+
+   **解读与后续**：高 ``bucket_trunc`` 常与 **高 ``similarity_pct`` + 大 ``min_cluster`` + 分桶指纹较粗** 叠加有关，表现为桶内反复 seed / rebucket 仍难凑满簇；若同时 **回填高、成团率低**，可优先调参或改进分桶/提前打散策略。``debugfs/summary`` 仅保留 **全局** ``miner_bucket_trunc`` 等字段；**不再逐 memcg 打印** 上述切片（避免刷屏与锁内遍历成本），详细分 memcg 数据以实验日志或本文档记录为准。
+
+   **口径说明**：全局 ``miner_rounds`` 按「整次 miner 块」递增；per-memcg 的 ``rounds`` 按「该 memcg 每 node 每轮一次 ``kagg_miner_scan_lruvec``」递增，在 **多 node** 或计数边界下可能与全局数字略有偏差，对比时以语义为准。

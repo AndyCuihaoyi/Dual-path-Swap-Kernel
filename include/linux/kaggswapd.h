@@ -52,6 +52,11 @@ void kagg_sample_scan_pgdat(struct pglist_data *pgdat,
 				kagg_page_action_fn action_fn,
 				void *priv);
 
+#if defined(CONFIG_MEMCG)
+struct mem_cgroup;
+void kagg_memcg_meta_free(struct mem_cgroup *memcg);
+#endif
+
 #endif /* CONFIG_KAGGSWAPD */
 
 #endif /* _LINUX_KAGGSWAPD_H */

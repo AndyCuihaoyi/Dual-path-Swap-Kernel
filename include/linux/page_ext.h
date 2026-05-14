@@ -76,6 +76,8 @@ struct page_ext_agg {
  * struct page_ext_agg_data - ring + group link + intrusive miner hash node.
  *
  * The miner uses miner_node for in-place bucket chaining (no extra allocation).
+ * Member struct page * for a cluster is resolved after bucketing by scanning
+ * the miner-isolated page list (see kagg_miner_emit_cluster()).
  */
 struct page_ext_agg_data {
 	struct page_group		*group;
@@ -130,6 +132,8 @@ static inline void page_ext_agg_push_window_into(struct page_ext_agg_data *d,
 	if (!d)
 		return;
 	i = READ_ONCE(d->head);
+	if (unlikely((unsigned int)i >= MAX_PAGE_EXT_AGG_WINDOW))
+		i = 0;
 	d->window_ids[i] = win_id;
 	i++;
 	if (unlikely(i >= MAX_PAGE_EXT_AGG_WINDOW))

@@ -59,6 +59,9 @@
 #include <linux/tracehook.h>
 #include <linux/psi.h>
 #include <linux/seq_buf.h>
+#ifdef CONFIG_KAGGSWAPD
+#include <linux/kaggswapd.h>
+#endif
 #include "internal.h"
 #include <net/sock.h>
 #include <net/ip.h>
@@ -5444,6 +5447,9 @@ static void mem_cgroup_css_offline(struct cgroup_subsys_state *css)
 
 	drain_all_stock(memcg);
 
+#if defined(CONFIG_KAGGSWAPD) && defined(CONFIG_MEMCG)
+	kagg_memcg_meta_free(memcg);
+#endif
 	mem_cgroup_id_put(memcg);
 }
 

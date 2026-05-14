@@ -28,8 +28,10 @@
 #include <linux/slab.h>
 #include <linux/rmap.h>
 #include <linux/sched.h>
+#include <linux/sort.h>
 #include <linux/spinlock.h>
 #include <linux/swap.h>
+#include <linux/printk.h>
 
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 #include <linux/huge_mm.h>
@@ -60,17 +62,165 @@ int sysctl_dual_path_miner_min_cluster __read_mostly = 33;
 #define KAGG_MINER_BATCH_MAX	128U
 #define KAGG_MINER_CLUSTER_MAX	256U
 #define KAGG_MINER_RESCHED_QUOTA	64U
-#define KAGG_MINER_VIEW_MAX	4096U
+#define KAGG_MINER_VIEW_MAX	8192U
+/*
+ * Max inactive-anon LRU slots scanned in one isolate_chunk() call when filling
+ * chunk_target. Allows wrapping past tail (list head) mid-chunk when the
+ * round-robin cursor falls in a sparse region, without unbounded lru_lock hold.
+ */
+#define KAGG_MINER_ISO_SCAN_ABS_MAX	32768U
+/*
+ * Bound greedy seed rounds per hash bucket: with a high min_cluster and low
+ * match rate, seeds are repeatedly peeled and tiny clusters rebucket'd back,
+ * which can require an enormous number of iterations before the bucket drains.
+ */
+#define KAGG_MINER_BUCKET_SEED_MAX	8192U
 
 static atomic_t kagg_win_next_atomic = ATOMIC_INIT(1);
-static unsigned long kagg_miner_cursor_pfn[MAX_NUMNODES];
-static bool kagg_miner_cursor_valid[MAX_NUMNODES];
 /*
  * Scratch buffers for kaggswapd thread to avoid large on-stack arrays.
  * kaggswapd is single-threaded in this tree.
  */
 static struct page *kagg_vma_seed_buf[KAGG_VMA_SEED_MAX];
 static struct hlist_head kagg_miner_bucket_buf[KAGG_MINER_HASH_SIZE];
+static struct page *kagg_miner_emit_pages_buf[KAGG_MINER_CLUSTER_MAX];
+static struct page_ext_agg_data *kagg_miner_cluster_memd_buf[KAGG_MINER_CLUSTER_MAX];
+
+/*
+ * Sorted (by page_ext_agg_data *) map for isolated pages: rebuilt once per
+ * kagg_miner_cluster_and_putback to avoid O(nmem * isolated) scans in emit.
+ */
+struct kagg_miner_iso_pair {
+	struct page_ext_agg_data	*d;
+	struct page			*page;
+};
+
+static struct kagg_miner_iso_pair kagg_miner_iso_map[KAGG_MINER_VIEW_MAX];
+static unsigned int kagg_miner_iso_nmap;
+
+/*
+ * Per-memcg miner metadata: cursor and key counters.
+ * - cursor_lru_steps[]: inactive anon LRU resume cursor per node.
+ * - counters: best-effort cumulative stats (debug visibility).
+ */
+struct kagg_memcg_meta {
+	struct hlist_node		node;
+	unsigned short			memcg_id;
+	unsigned int			cursor_lru_steps[MAX_NUMNODES];
+#ifdef CONFIG_KAGGSWAPD_DEBUG
+	atomic64_t			miner_rounds;
+	atomic64_t			view_target_pages;
+	atomic64_t			isolated_pages;
+	atomic64_t			clusters_emitted;
+	atomic64_t			cluster_pages;
+	atomic64_t			putback_pages;
+	atomic64_t			bucket_trunc;
+#endif
+};
+
+#ifdef CONFIG_MEMCG
+#define KAGG_MEMCG_META_HASH_BITS	8
+#define KAGG_MEMCG_META_HASH_SIZE	(1U << KAGG_MEMCG_META_HASH_BITS)
+static struct hlist_head kagg_memcg_meta_hash[KAGG_MEMCG_META_HASH_SIZE];
+static DEFINE_SPINLOCK(kagg_memcg_meta_lock);
+static inline unsigned int kagg_memcg_meta_hash_idx(unsigned short memcg_id)
+{
+	return (unsigned int)memcg_id & (KAGG_MEMCG_META_HASH_SIZE - 1U);
+}
+#endif
+static struct kagg_memcg_meta kagg_root_meta;
+
+static struct kagg_memcg_meta *kagg_memcg_meta_get(struct mem_cgroup *memcg,
+						    bool create)
+{
+#ifdef CONFIG_MEMCG
+	unsigned short id;
+	struct kagg_memcg_meta *meta;
+	struct kagg_memcg_meta *new_meta;
+	unsigned int idx;
+
+	if (mem_cgroup_disabled() || !memcg)
+		return &kagg_root_meta;
+
+	id = mem_cgroup_id(memcg);
+	if (!id)
+		return &kagg_root_meta;
+
+	idx = kagg_memcg_meta_hash_idx(id);
+	spin_lock(&kagg_memcg_meta_lock);
+	hlist_for_each_entry(meta, &kagg_memcg_meta_hash[idx], node) {
+		if (meta->memcg_id == id) {
+			spin_unlock(&kagg_memcg_meta_lock);
+			return meta;
+		}
+	}
+	spin_unlock(&kagg_memcg_meta_lock);
+
+	if (!create)
+		return NULL;
+
+	new_meta = kzalloc(sizeof(*new_meta), GFP_ATOMIC);
+	if (!new_meta)
+		return NULL;
+	new_meta->memcg_id = id;
+#ifdef CONFIG_KAGGSWAPD_DEBUG
+	atomic64_set(&new_meta->miner_rounds, 0);
+	atomic64_set(&new_meta->view_target_pages, 0);
+	atomic64_set(&new_meta->isolated_pages, 0);
+	atomic64_set(&new_meta->clusters_emitted, 0);
+	atomic64_set(&new_meta->cluster_pages, 0);
+	atomic64_set(&new_meta->putback_pages, 0);
+	atomic64_set(&new_meta->bucket_trunc, 0);
+#endif
+
+	spin_lock(&kagg_memcg_meta_lock);
+	hlist_for_each_entry(meta, &kagg_memcg_meta_hash[idx], node) {
+		if (meta->memcg_id == id) {
+			spin_unlock(&kagg_memcg_meta_lock);
+			kfree(new_meta);
+			return meta;
+		}
+	}
+	hlist_add_head(&new_meta->node, &kagg_memcg_meta_hash[idx]);
+	spin_unlock(&kagg_memcg_meta_lock);
+	return new_meta;
+#else
+	(void)memcg;
+	(void)create;
+	return &kagg_root_meta;
+#endif
+}
+
+#if defined(CONFIG_MEMCG)
+/*
+ * mem_cgroup_css_offline() calls this before mem_cgroup_id_put(): drop per-id
+ * miner cursor/stats so recycled memcg_id cannot alias stale meta (slab leak).
+ */
+void kagg_memcg_meta_free(struct mem_cgroup *memcg)
+{
+	unsigned short id;
+	unsigned int idx;
+	struct kagg_memcg_meta *meta;
+
+	if (!memcg || mem_cgroup_disabled())
+		return;
+	id = mem_cgroup_id(memcg);
+	if (!id)
+		return;
+
+	idx = kagg_memcg_meta_hash_idx(id);
+	spin_lock(&kagg_memcg_meta_lock);
+	hlist_for_each_entry(meta, &kagg_memcg_meta_hash[idx], node) {
+		if (meta->memcg_id == id) {
+			hlist_del_init(&meta->node);
+			spin_unlock(&kagg_memcg_meta_lock);
+			kfree(meta);
+			return;
+		}
+	}
+	spin_unlock(&kagg_memcg_meta_lock);
+}
+#endif
 
 static unsigned int kagg_percent_target(unsigned long total, unsigned int pct,
 					unsigned int cap)
@@ -117,8 +267,6 @@ u16 kagg_next_window_id(void)
 
 #ifdef CONFIG_KAGGSWAPD_DEBUG
 
-#define KAGG_DBG_RING	32
-
 static atomic64_t kagg_dbg_scan_rounds;
 static atomic64_t kagg_dbg_pages_stamped;
 static atomic64_t kagg_dbg_dedup_same_win;
@@ -128,113 +276,268 @@ static atomic64_t kagg_dbg_miner_clusters_emitted;
 static atomic64_t kagg_dbg_miner_cluster_pages;
 static atomic64_t kagg_dbg_miner_putback_pages;
 static atomic64_t kagg_dbg_miner_groups_cleared;
+static atomic64_t kagg_dbg_miner_members_linked;
+static atomic64_t kagg_dbg_miner_bucket_trunc;
+static atomic64_t kagg_dbg_miner_block_start;
+static atomic64_t kagg_dbg_miner_view_target_pages;
+static atomic64_t kagg_dbg_miner_view_target_cap_hits;
+static atomic64_t kagg_dbg_miner_iso_chunks;
+static atomic64_t kagg_dbg_miner_iso_target_slots;
+static atomic64_t kagg_dbg_miner_iso_walked_slots;
+static atomic64_t kagg_dbg_miner_iso_chunk_underfill;
+static atomic64_t kagg_dbg_miner_iso_chunk_maxscan_hit;
+/* LRU walk: skipped before elevate refcount */
+static atomic64_t kagg_dbg_miner_iso_skip_non_anon;
+static atomic64_t kagg_dbg_miner_iso_skip_huge;
+static atomic64_t kagg_dbg_miner_iso_skip_not_lru_walk;
+static atomic64_t kagg_dbg_miner_iso_skip_not_evictable;
+static atomic64_t kagg_dbg_miner_iso_skip_no_ref;
+/* isolate_lru_page: attempts == sum(nr_cands); classify -EBUSY-ish paths */
+static atomic64_t kagg_dbg_miner_iso_attempts;
+static atomic64_t kagg_dbg_miner_iso_fail_not_lru;
+static atomic64_t kagg_dbg_miner_iso_fail_race;
 
-static atomic_t kagg_dbg_wr_seq;
-static unsigned long kagg_dbg_recent_pfn[KAGG_DBG_RING];
+#ifdef CONFIG_MEMCG
+#define KAGG_MEMCG_TOP_N	10
 
-static void kagg_dbg_note_stamp(unsigned long pfn)
+struct kagg_memcg_top_row {
+	unsigned int	memcg_id;
+	unsigned long	anon_act;
+	unsigned long	anon_inact;
+	long long	miner_rounds;
+	long long	group_size;
+	long long	clustered_pages;
+};
+
+/* Descending by group_size (clusters_emitted); tie-break clustered_pages, memcg_id. */
+static int kagg_memcg_top_row_cmp(const void *a, const void *b)
 {
-	unsigned s = (unsigned)atomic_inc_return(&kagg_dbg_wr_seq);
+	const struct kagg_memcg_top_row *ra = a;
+	const struct kagg_memcg_top_row *rb = b;
 
-	WRITE_ONCE(kagg_dbg_recent_pfn[(s - 1U) % KAGG_DBG_RING], pfn);
+	if (ra->group_size > rb->group_size)
+		return -1;
+	if (ra->group_size < rb->group_size)
+		return 1;
+	if (ra->clustered_pages > rb->clustered_pages)
+		return -1;
+	if (ra->clustered_pages < rb->clustered_pages)
+		return 1;
+	if (ra->memcg_id < rb->memcg_id)
+		return -1;
+	if (ra->memcg_id > rb->memcg_id)
+		return 1;
+	return 0;
 }
+
+static void kagg_memcg_top_row_fill(struct mem_cgroup *memcg,
+				    struct kagg_memcg_top_row *row)
+{
+	struct kagg_memcg_meta *meta;
+
+	row->memcg_id = (unsigned int)mem_cgroup_id(memcg);
+	row->anon_act = memcg_page_state(memcg, NR_ACTIVE_ANON);
+	row->anon_inact = memcg_page_state(memcg, NR_INACTIVE_ANON);
+	meta = kagg_memcg_meta_get(memcg, false);
+	row->miner_rounds = meta ? (long long)atomic64_read(&meta->miner_rounds) : 0LL;
+	row->group_size = meta ? (long long)atomic64_read(&meta->clusters_emitted) : 0LL;
+	row->clustered_pages = meta ? (long long)atomic64_read(&meta->cluster_pages) : 0LL;
+}
+#endif /* CONFIG_MEMCG */
 
 static int kagg_summary_show(struct seq_file *m, void *v)
 {
-	unsigned w, count, k;
+	u64 miner_rounds;
+	unsigned long anon_active, anon_inactive, file_active, file_inactive;
+	u64 anon_total, file_total;
+	u64 memcg_total = 0, memcg_online_nr = 0;
+	u64 memcg_max_depth = 0;
+	u64 total_groups = 0, total_group_pages = 0;
 
 	(void)v;
 
-	seq_printf(m, "scan_rounds %lld\n",
+	anon_active = global_node_page_state(NR_ACTIVE_ANON);
+	anon_inactive = global_node_page_state(NR_INACTIVE_ANON);
+	file_active = global_node_page_state(NR_ACTIVE_FILE);
+	file_inactive = global_node_page_state(NR_INACTIVE_FILE);
+	anon_total = (u64)anon_active + (u64)anon_inactive;
+	file_total = (u64)file_active + (u64)file_inactive;
+
+	seq_puts(m, "=== 系统概况 (System) ===\n");
+	seq_printf(m, "numa_online_nodes(NUMA节点数) %u\n", num_online_nodes());
+	seq_printf(m, "mem_total_pages(系统总页) %lu\n", totalram_pages());
+	seq_printf(m, "mem_anon_pages(匿名页总数) %llu [active=%lu inactive=%lu]\n",
+		   (unsigned long long)anon_total, anon_active, anon_inactive);
+	seq_printf(m, "mem_file_pages(文件页总数) %llu [active=%lu inactive=%lu]\n",
+		   (unsigned long long)file_total, file_active, file_inactive);
+#ifdef CONFIG_MEMCG
+	if (!mem_cgroup_disabled()) {
+		struct mem_cgroup *memcg = NULL;
+		struct kagg_memcg_top_row *rows = NULL;
+		size_t row_n = 0, row_cap = 0;
+
+		while ((memcg = mem_cgroup_iter(NULL, memcg, NULL))) {
+			struct mem_cgroup *p = memcg;
+			u64 depth = 0;
+
+			memcg_total++;
+			if (mem_cgroup_online(memcg))
+				memcg_online_nr++;
+			while (p) {
+				depth++;
+				p = parent_mem_cgroup(p);
+			}
+			if (depth > memcg_max_depth)
+				memcg_max_depth = depth;
+
+			if (row_n >= row_cap) {
+				struct kagg_memcg_top_row *nr;
+				size_t ncap;
+
+				if (!row_cap)
+					ncap = 64;
+				else if (row_cap > (SIZE_MAX / 2 / sizeof(*rows)))
+					ncap = SIZE_MAX / sizeof(*rows);
+				else
+					ncap = row_cap * 2;
+				nr = kvmalloc_array(ncap, sizeof(*rows), GFP_KERNEL);
+				if (!nr) {
+					mem_cgroup_iter_break(NULL, memcg);
+					break;
+				}
+				if (rows) {
+					memcpy(nr, rows, row_n * sizeof(*rows));
+					kvfree(rows);
+				}
+				rows = nr;
+				row_cap = ncap;
+			}
+			kagg_memcg_top_row_fill(memcg, &rows[row_n]);
+			row_n++;
+		}
+		seq_printf(m,
+			   "memcg_summary(total/online/hierarchy/max_depth) %llu/%llu/%u/%llu\n",
+			   (unsigned long long)memcg_total,
+			   (unsigned long long)memcg_online_nr,
+			   root_mem_cgroup->use_hierarchy ? 1U : 0U,
+			   (unsigned long long)memcg_max_depth);
+		seq_puts(m,
+			 "memcg_top10(by group_size desc, top 10; group_size=clusters_emitted; clustered_pages=cluster_pages; no meta => last three are 0)\n");
+		if (rows && row_n) {
+			size_t i;
+			unsigned int lines;
+
+			sort(rows, row_n, sizeof(*rows), kagg_memcg_top_row_cmp, NULL);
+			lines = (unsigned int)min_t(size_t, row_n, (size_t)KAGG_MEMCG_TOP_N);
+			for (i = 0; i < lines; i++) {
+				struct kagg_memcg_top_row *r = &rows[i];
+
+				seq_printf(m,
+					   "memcg_id=%u active_anon_pages=%lu inactive_anon_pages=%lu miner_rounds=%lld group_size=%lld clustered_pages=%lld\n",
+					   r->memcg_id, r->anon_act, r->anon_inact,
+					   r->miner_rounds, r->group_size,
+					   r->clustered_pages);
+			}
+		} else if (memcg_total) {
+			seq_puts(m,
+				 "memcg_top10(alloc_failed or incomplete; try smaller hierarchy or raise memory)\n");
+		}
+		kvfree(rows);
+	} else {
+		seq_puts(m, "memcg_status(状态) disabled\n");
+	}
+#else
+	seq_puts(m, "memcg_status(状态) not_configured\n");
+#endif
+
+	seq_puts(m, "\n=== 采样统计 (Sampling) ===\n");
+	seq_printf(m, "scan_rounds(采样轮次) %lld\n",
 		   (long long)atomic64_read(&kagg_dbg_scan_rounds));
-	seq_printf(m, "pages_stamped %lld\n",
+	seq_printf(m, "pages_stamped(打标页数) %lld\n",
 		   (long long)atomic64_read(&kagg_dbg_pages_stamped));
-	seq_printf(m, "dedup_same_window %lld\n",
+	seq_printf(m, "dedup_same_window(同窗去重次数) %lld\n",
 		   (long long)atomic64_read(&kagg_dbg_dedup_same_win));
-	seq_printf(m, "miner_rounds %lld\n",
-		   (long long)atomic64_read(&kagg_dbg_miner_rounds));
-	seq_printf(m, "miner_isolated_pages %lld\n",
+
+	seq_puts(m, "\n=== 挖掘核心统计 (Mining Core) ===\n");
+	miner_rounds = (u64)atomic64_read(&kagg_dbg_miner_rounds);
+	seq_printf(m, "miner_rounds(挖掘轮次) %lld\n",
+		   (long long)miner_rounds);
+	seq_printf(m, "miner_isolated_pages(隔离页累计) %lld\n",
 		   (long long)atomic64_read(&kagg_dbg_miner_isolated_pages));
-	seq_printf(m, "miner_clusters_emitted %lld\n",
+	seq_printf(m, "miner_view_target_pages(挖掘目标页累计) %lld\n",
+		   (long long)atomic64_read(&kagg_dbg_miner_view_target_pages));
+
+	seq_puts(m, "\n--- 聚类结果 (Clustering) ---\n");
+	seq_printf(m, "miner_clusters_emitted(产出组累计) %lld\n",
 		   (long long)atomic64_read(&kagg_dbg_miner_clusters_emitted));
-	seq_printf(m, "miner_cluster_pages %lld\n",
+	seq_printf(m, "miner_cluster_pages(聚合页累计) %lld\n",
 		   (long long)atomic64_read(&kagg_dbg_miner_cluster_pages));
-	seq_printf(m, "miner_putback_pages %lld\n",
+	seq_printf(m, "miner_putback_pages(LRU回填页累计) %lld\n",
 		   (long long)atomic64_read(&kagg_dbg_miner_putback_pages));
-	seq_printf(m, "miner_groups_cleared %lld\n",
+	seq_printf(m, "miner_groups_cleared(清理组累计) %lld\n",
 		   (long long)atomic64_read(&kagg_dbg_miner_groups_cleared));
-	seq_printf(m, "mem_total_pages %lu\n", totalram_pages());
-	seq_printf(m, "mem_anon_active_pages %lu\n",
-		   global_node_page_state(NR_ACTIVE_ANON));
-	seq_printf(m, "mem_anon_inactive_pages %lu\n",
-		   global_node_page_state(NR_INACTIVE_ANON));
-	seq_printf(m, "next_win_id %u (best-effort racy read)\n",
-		   (unsigned int)atomic_read(&kagg_win_next_atomic) & 0xFFFFu);
-	seq_puts(m, "\nagg_groups_per_node (best-effort):\n");
+	seq_printf(m, "miner_members_linked(入组成员页累计) %lld\n",
+		   (long long)atomic64_read(&kagg_dbg_miner_members_linked));
+	seq_printf(m, "miner_bucket_trunc(分桶截断次数) %lld\n",
+		   (long long)atomic64_read(&kagg_dbg_miner_bucket_trunc));
+	seq_puts(m, "\n=== 聚合组概览 (best-effort) ===\n");
 #ifdef CONFIG_DUAL_PATH_SWAP
 	{
 		struct pglist_data *pgdat;
 
 		for_each_online_pgdat(pgdat) {
-			struct lruvec *lruvec = mem_cgroup_lruvec(NULL, pgdat);
 			struct page_group *grp;
 			unsigned long flags;
-			unsigned int groups = 0;
-			u64 pages = 0;
+#ifdef CONFIG_MEMCG
+			if (!mem_cgroup_disabled()) {
+				struct mem_cgroup *memcg = NULL;
+
+				while ((memcg = mem_cgroup_iter(NULL, memcg, NULL))) {
+					struct lruvec *lruvec;
+
+					if (!mem_cgroup_online(memcg))
+						continue;
+					lruvec = mem_cgroup_lruvec(memcg, pgdat);
+					spin_lock_irqsave(&pgdat->lru_lock, flags);
+					list_for_each_entry(grp, &lruvec->agg_list, lru) {
+						total_groups++;
+						total_group_pages += grp->nr_pages;
+					}
+					spin_unlock_irqrestore(&pgdat->lru_lock, flags);
+				}
+				continue;
+			}
+#endif
+			{
+				struct lruvec *lruvec = mem_cgroup_lruvec(NULL, pgdat);
 
 			spin_lock_irqsave(&pgdat->lru_lock, flags);
 			list_for_each_entry(grp, &lruvec->agg_list, lru) {
-				groups++;
-				pages += grp->nr_pages;
+				total_groups++;
+				total_group_pages += grp->nr_pages;
 			}
 			spin_unlock_irqrestore(&pgdat->lru_lock, flags);
-			seq_printf(m, "node%d groups %u pages %llu\n",
-				   pgdat->node_id, groups,
-				   (unsigned long long)pages);
+			}
+		}
+		if (total_groups) {
+			u64 avg_int = div64_u64(total_group_pages, total_groups);
+			u64 avg_frac = div64_u64((total_group_pages % total_groups) * 100,
+						 total_groups);
+
+			seq_printf(m,
+				   "all_nodes groups(组数) %llu pages(页数) %llu avg_group_pages(平均组大小) %llu.%02llu\n",
+				   (unsigned long long)total_groups,
+				   (unsigned long long)total_group_pages,
+				   (unsigned long long)avg_int,
+				   (unsigned long long)avg_frac);
+		} else {
+			seq_puts(m,
+				 "all_nodes groups(组数) 0 pages(页数) 0 avg_group_pages(平均组大小) 0.00\n");
 		}
 	}
 #endif
-	seq_puts(m, "\nrecent_stamped_pfns (newest first, best-effort):\n");
-
-	w = (unsigned)atomic_read(&kagg_dbg_wr_seq);
-	count = min_t(unsigned, w, KAGG_DBG_RING);
-	for (k = 0; k < count; k++) {
-		unsigned idx = (w - 1U - k) % KAGG_DBG_RING;
-		unsigned long pfn = READ_ONCE(kagg_dbg_recent_pfn[idx]);
-		struct page *page;
-		struct page_ext_agg *agg;
-		struct page_ext_agg_data *d;
-		int j;
-
-		seq_printf(m, "pfn %#lx ", pfn);
-		if (!pfn_valid(pfn)) {
-			seq_puts(m, "invalid\n");
-			continue;
-		}
-		page = pfn_to_online_page(pfn);
-		if (!page) {
-			seq_puts(m, "offline\n");
-			continue;
-		}
-		page = compound_head(page);
-		agg = lookup_page_ext_agg(page);
-		if (!agg) {
-			seq_puts(m, "no_agg\n");
-			continue;
-		}
-		d = page_ext_agg_get_data_maybe(agg);
-		if (!d) {
-			seq_puts(m, "no_agg_data\n");
-			continue;
-		}
-		seq_printf(m, "head %d last_win %u group %p win[",
-			   d->head, (unsigned int)d->last_kagg_win, d->group);
-		for (j = 0; j < MAX_PAGE_EXT_AGG_WINDOW; j++) {
-			seq_printf(m, "%s%u", j ? "," : "",
-				   (unsigned int)d->window_ids[j]);
-		}
-		seq_puts(m, "]\n");
-	}
+	seq_printf(m, "next_win_id(下一个窗口ID, 竞态只读) %u\n",
+		   (unsigned int)atomic_read(&kagg_win_next_atomic) & 0xFFFFu);
 	return 0;
 }
 
@@ -275,6 +578,8 @@ static void kagg_try_mark_window(struct page *page, u16 win_id, bool require_lru
 
 	page = compound_head(page);
 
+	if (unlikely(!pfn_valid(page_to_pfn(page))))
+		return;
 	if (require_lru && !PageLRU(page))
 		return;
 	if (PageHuge(page) || unlikely(!page_evictable(page)))
@@ -288,18 +593,25 @@ static void kagg_try_mark_window(struct page *page, u16 win_id, bool require_lru
 	d = page_ext_agg_ensure_data(agg);
 	if (!d)
 		return;
+	/*
+	 * LRU scan drops lru_lock between get_page and here; free can clear
+	 * agg->data under dual_path_page_ext_prepare_free. Re-check linkage.
+	 */
+	if (unlikely(READ_ONCE(agg->data) != d))
+		return;
 	if (READ_ONCE(d->last_kagg_win) == win_id) {
 #ifdef CONFIG_KAGGSWAPD_DEBUG
 		atomic64_inc(&kagg_dbg_dedup_same_win);
 #endif
 		return;
 	}
+	if (unlikely(READ_ONCE(agg->data) != d))
+		return;
 
 	page_ext_agg_push_window_into(d, win_id);
 	WRITE_ONCE(d->last_kagg_win, win_id);
 #ifdef CONFIG_KAGGSWAPD_DEBUG
 	atomic64_inc(&kagg_dbg_pages_stamped);
-	kagg_dbg_note_stamp(page_to_pfn(page));
 #endif
 }
 
@@ -449,6 +761,10 @@ static void kagg_scan_inactive_vma_expand(struct lruvec *lruvec,
 			pos = prev_pos;
 			continue;
 		}
+		if (!page_mapped(page)) {
+			pos = prev_pos;
+			continue;
+		}
 		if (!get_page_unless_zero(page)) {
 			pos = prev_pos;
 			continue;
@@ -488,6 +804,8 @@ static void kagg_scan_lru_bounded(struct lruvec *lruvec, enum lru_list lruid,
 		scanned++;
 		page = compound_head(page);
 		if (get_page_unless_zero(page)) {
+			/* Refcount must be visible before we drop lru_lock vs. free path. */
+			smp_mb();
 			spin_unlock_irq(&pgdat->lru_lock);
 			action_fn(page, win_id, priv);
 			put_page(page);
@@ -499,33 +817,13 @@ static void kagg_scan_lru_bounded(struct lruvec *lruvec, enum lru_list lruid,
 	spin_unlock_irq(&pgdat->lru_lock);
 }
 
-/*
- * Sampling plane entrypoint:
- * mode 0/1/2 are LRU sampling variants; mode 3 is seed-based VMA expansion.
- */
-void kagg_sample_scan_pgdat(struct pglist_data *pgdat,
-			    enum kagg_scan_mode scan_mode,
-			    unsigned int scan_pct, u16 win_id,
-			    kagg_page_action_fn action_fn,
-			    void *priv)
+static void kagg_sample_scan_lruvec(struct lruvec *lruvec,
+				    enum kagg_scan_mode mode,
+				    unsigned int scan_pct, u16 win_id,
+				    kagg_page_action_fn action_fn,
+				    void *priv)
 {
-	struct lruvec *lruvec;
 	unsigned long inactive_sz, active_sz, max_scan;
-	enum kagg_scan_mode mode;
-
-	if (!dual_path_swap_enabled())
-		return;
-
-	if (!pgdat || unlikely(!num_online_nodes()))
-		return;
-
-	lruvec = mem_cgroup_lruvec(NULL, pgdat);
-
-	if (!action_fn)
-		action_fn = kagg_default_sample_mark;
-
-	mode = (enum kagg_scan_mode)
-		clamp_val((int)scan_mode, 0, (int)KAGG_SCAN_MODE_NR - 1);
 
 	inactive_sz = lruvec_lru_size(lruvec, LRU_INACTIVE_ANON, MAX_NR_ZONES - 1);
 	active_sz = lruvec_lru_size(lruvec, LRU_ACTIVE_ANON, MAX_NR_ZONES - 1);
@@ -563,6 +861,51 @@ void kagg_sample_scan_pgdat(struct pglist_data *pgdat,
 		 */
 		break;
 	}
+}
+
+/*
+ * Sampling plane entrypoint:
+ * mode 0/1/2 are LRU sampling variants; mode 3 is seed-based VMA expansion.
+ * Per pgdat, walk all memcg lruvecs to avoid only sampling root memcg pages.
+ */
+void kagg_sample_scan_pgdat(struct pglist_data *pgdat,
+			    enum kagg_scan_mode scan_mode,
+			    unsigned int scan_pct, u16 win_id,
+			    kagg_page_action_fn action_fn,
+			    void *priv)
+{
+	enum kagg_scan_mode mode;
+
+	if (!dual_path_swap_enabled())
+		return;
+
+	if (!pgdat || unlikely(!num_online_nodes()))
+		return;
+
+	if (!action_fn)
+		action_fn = kagg_default_sample_mark;
+
+	mode = (enum kagg_scan_mode)
+		clamp_val((int)scan_mode, 0, (int)KAGG_SCAN_MODE_NR - 1);
+
+#ifdef CONFIG_MEMCG
+	if (!mem_cgroup_disabled()) {
+		struct mem_cgroup *memcg = NULL;
+
+		while ((memcg = mem_cgroup_iter(NULL, memcg, NULL))) {
+			struct lruvec *lruvec;
+
+			if (!mem_cgroup_online(memcg))
+				continue;
+			lruvec = mem_cgroup_lruvec(memcg, pgdat);
+			kagg_sample_scan_lruvec(lruvec, mode, scan_pct, win_id,
+						action_fn, priv);
+		}
+		return;
+	}
+#endif
+	kagg_sample_scan_lruvec(mem_cgroup_lruvec(NULL, pgdat), mode, scan_pct,
+				win_id, action_fn, priv);
 }
 
 static void kagg_miner_init_buckets(struct hlist_head *buckets)
@@ -639,6 +982,20 @@ static unsigned int kagg_windows_unique(const struct page_ext_agg_data *d,
 		if (!dup)
 			uniq[cnt++] = id;
 	}
+	if (cnt > 1U) {
+		unsigned int seen, j;
+		u16 v;
+
+		for (seen = 1U; seen < cnt; seen++) {
+			v = uniq[seen];
+			j = seen;
+			while (j > 0U && uniq[j - 1U] > v) {
+				uniq[j] = uniq[j - 1U];
+				j--;
+			}
+			uniq[j] = v;
+		}
+	}
 	return cnt;
 }
 
@@ -654,12 +1011,17 @@ static bool kagg_miner_similar(const struct page_ext_agg_data *seed,
 	if (!ns || !nc)
 		return false;
 
-	for (i = 0; i < ns; i++) {
-		for (j = 0; j < nc; j++) {
-			if (s[i] == c[j]) {
-				inter++;
-				break;
-			}
+	i = 0;
+	j = 0;
+	while (i < ns && j < nc) {
+		if (s[i] == c[j]) {
+			inter++;
+			i++;
+			j++;
+		} else if (s[i] < c[j]) {
+			i++;
+		} else {
+			j++;
 		}
 	}
 	denom = max(ns, nc);
@@ -693,90 +1055,306 @@ static void __maybe_unused kagg_miner_clear_old_groups(struct lruvec *lruvec)
 #endif
 }
 
-static void kagg_miner_emit_cluster(struct lruvec *lruvec, unsigned int cnt)
+static int kagg_miner_iso_pair_cmp(const void *a, const void *b)
+{
+	const struct kagg_miner_iso_pair *pa = a;
+	const struct kagg_miner_iso_pair *pb = b;
+
+	if (pa->d < pb->d)
+		return -1;
+	if (pa->d > pb->d)
+		return 1;
+	return 0;
+}
+
+/*
+ * Fill kagg_miner_iso_map[], sorted by page_ext_agg_data * for lookup in emit.
+ */
+static unsigned int kagg_miner_build_iso_sorted_map(struct list_head *all_isolated)
+{
+	struct page *page;
+	unsigned int n = 0;
+
+	list_for_each_entry(page, all_isolated, lru) {
+		struct page *head = compound_head(page);
+		struct page_ext_agg *agg = lookup_page_ext_agg(head);
+		struct page_ext_agg_data *d = page_ext_agg_get_data_maybe(agg);
+
+		if (!d)
+			continue;
+		if (unlikely(n >= KAGG_MINER_VIEW_MAX)) {
+			WARN_ON_ONCE(1);
+			break;
+		}
+		kagg_miner_iso_map[n].d = d;
+		kagg_miner_iso_map[n].page = head;
+		n++;
+		if (!(n % KAGG_MINER_RESCHED_QUOTA))
+			cond_resched();
+	}
+	if (n > 1U)
+		sort(kagg_miner_iso_map, (size_t)n,
+		     sizeof(kagg_miner_iso_map[0]), kagg_miner_iso_pair_cmp, NULL);
+	return n;
+}
+
+/* Strip miner hash nodes only; isolated pages remain on @all_isolated for putback. */
+static void kagg_miner_bucket_strip_nodes(struct hlist_head *bucket)
+{
+	struct page_ext_agg_data *d;
+	struct hlist_node *tmp;
+
+	hlist_for_each_entry_safe(d, tmp, bucket, miner_node)
+		hlist_del_init(&d->miner_node);
+}
+
+static struct page *kagg_miner_iso_map_lookup(struct page_ext_agg_data *want)
+{
+	unsigned int lo = 0, hi = kagg_miner_iso_nmap;
+
+	while (lo < hi) {
+		unsigned int mid = lo + ((hi - lo) >> 1);
+		struct page_ext_agg_data *md = kagg_miner_iso_map[mid].d;
+
+		if (md == want)
+			return kagg_miner_iso_map[mid].page;
+		if ((uintptr_t)md < (uintptr_t)want)
+			lo = mid + 1U;
+		else
+			hi = mid;
+	}
+	return NULL;
+}
+
+static void kagg_miner_rebucket_agg_data(struct hlist_head *buckets,
+					 struct page_ext_agg_data **memd,
+					 unsigned int nmem)
+{
+	unsigned int j;
+
+	for (j = 0; j < nmem; j++) {
+		struct page_ext_agg_data *d = memd[j];
+		unsigned int idx = kagg_miner_hash_prefix(d);
+
+		if (!hlist_unhashed(&d->miner_node))
+			hlist_del_init(&d->miner_node);
+		hlist_add_head(&d->miner_node, &buckets[idx]);
+	}
+}
+
+static bool kagg_miner_emit_cluster(struct lruvec *lruvec,
+				    struct page_ext_agg_data **memd,
+				    unsigned int nmem,
+				    struct kagg_memcg_meta *meta)
 {
 	struct page_group *grp;
 	pg_data_t *pgdat = lruvec_pgdat(lruvec);
+	unsigned int i;
+	struct page **pages_mem = kagg_miner_emit_pages_buf;
 
-	grp = kzalloc(sizeof(*grp), GFP_NOWAIT | __GFP_NOWARN);
+	if (!nmem)
+		return false;
+
+	for (i = 0; i < nmem; i++) {
+		struct page_ext_agg_data *d = memd[i];
+		struct page *page;
+
+		if (unlikely(!d || READ_ONCE(d->group)))
+			return false;
+		page = kagg_miner_iso_map_lookup(d);
+		if (unlikely(!page))
+			return false;
+		pages_mem[i] = page;
+	}
+
+	grp = kzalloc(sizeof(*grp), GFP_KERNEL);
 	if (!grp)
-		return;
+		return false;
 	page_group_init(grp);
-	grp->nr_pages = cnt;
+	grp->nr_pages = nmem;
 	grp->creation_time = (u64)jiffies;
-	grp->hotness = (u16)min_t(unsigned int, cnt, 0xFFFFU);
+	grp->hotness = (u16)min_t(unsigned int, nmem, 0xFFFFU);
 
 	spin_lock_irq(&pgdat->lru_lock);
 	lruvec_page_group_add_tail(lruvec, grp);
 	spin_unlock_irq(&pgdat->lru_lock);
+
+	/*
+	 * Moving up to nmem pages under lru_lock + local IRQ off was long enough
+	 * to provoke rcu_sched stalls. The aggregate list head only needs a short
+	 * critical section; page_list links are private until d->group publishes.
+	 */
+	for (i = 0; i < nmem; i++) {
+		struct page *page = pages_mem[i];
+		struct page_ext_agg_data *d = memd[i];
+
+		list_del_init(&page->lru);
+		list_add_tail(&page->lru, &grp->page_list);
+		smp_wmb();
+		WRITE_ONCE(d->group, grp);
+		if (!((i + 1U) % KAGG_MINER_RESCHED_QUOTA))
+			cond_resched();
+	}
 #ifdef CONFIG_KAGGSWAPD_DEBUG
 	atomic64_inc(&kagg_dbg_miner_clusters_emitted);
-	atomic64_add(cnt, &kagg_dbg_miner_cluster_pages);
+	atomic64_add(nmem, &kagg_dbg_miner_cluster_pages);
+	atomic64_add(nmem, &kagg_dbg_miner_members_linked);
+	if (meta) {
+		atomic64_inc(&meta->clusters_emitted);
+		atomic64_add(nmem, &meta->cluster_pages);
+	}
+	pr_info_ratelimited("kaggswapd: page_group %p: linked %u member pages (node %d)\n",
+			      grp, nmem, pgdat->node_id);
 #endif
+	return true;
 }
 
-static unsigned int kagg_miner_isolate_chunk(struct pglist_data *pgdat,
+static unsigned int kagg_miner_isolate_chunk(struct lruvec *lruvec,
 					     unsigned int chunk_target,
-					     struct list_head *local_list)
+					     struct list_head *local_list,
+					     struct kagg_memcg_meta *meta)
 {
+	pg_data_t *pgdat = lruvec_pgdat(lruvec);
 	unsigned int nid = pgdat->node_id;
-	struct lruvec *lruvec = mem_cgroup_lruvec(NULL, pgdat);
 	struct list_head *head = &lruvec->lists[LRU_INACTIVE_ANON];
 	struct list_head *pos, *next;
 	struct page *cands[KAGG_MINER_BATCH_MAX];
 	unsigned int nr_cands = 0, i;
 	unsigned int isolated_ok = 0;
-	unsigned long cursor_pfn = READ_ONCE(kagg_miner_cursor_pfn[nid]);
-	bool cursor_valid = READ_ONCE(kagg_miner_cursor_valid[nid]);
+	unsigned int start_steps;
+	unsigned int skip;
+	unsigned int consumed;
+	unsigned int total_walked = 0;
+	unsigned long inactive_nr;
+	unsigned long max_scan;
+	unsigned int *cursor_lru_steps;
 
 	if (!chunk_target)
 		return 0;
 	if (chunk_target > KAGG_MINER_BATCH_MAX)
 		chunk_target = KAGG_MINER_BATCH_MAX;
+	cursor_lru_steps = meta ? meta->cursor_lru_steps : kagg_root_meta.cursor_lru_steps;
 
 	spin_lock_irq(&pgdat->lru_lock);
+
+	inactive_nr = lruvec_lru_size(lruvec, LRU_INACTIVE_ANON, MAX_NR_ZONES - 1);
+	max_scan = (unsigned long)chunk_target * 64UL;
+	if (max_scan < inactive_nr * 2UL)
+		max_scan = inactive_nr * 2UL;
+	if (max_scan > (unsigned long)KAGG_MINER_ISO_SCAN_ABS_MAX)
+		max_scan = (unsigned long)KAGG_MINER_ISO_SCAN_ABS_MAX;
+	if (max_scan < (unsigned long)chunk_target * 8UL)
+		max_scan = (unsigned long)chunk_target * 8UL;
+#ifdef CONFIG_KAGGSWAPD_DEBUG
+	atomic64_inc(&kagg_dbg_miner_iso_chunks);
+	atomic64_add(chunk_target, &kagg_dbg_miner_iso_target_slots);
+#endif
+
+	start_steps = READ_ONCE(cursor_lru_steps[nid]);
+	skip = start_steps;
 	pos = head->next;
-	if (cursor_valid) {
-		struct list_head *it;
+	while (skip && pos != head) {
+		pos = pos->next;
+		skip--;
+	}
+	if (skip) {
+		/* Cursor offset past list length; restart from head. */
+		WRITE_ONCE(cursor_lru_steps[nid], 0);
+		consumed = 0;
+		pos = head->next;
+	} else {
+		consumed = start_steps;
+	}
 
-		list_for_each(it, head) {
-			struct page *p = compound_head(lru_to_page(it));
+	/*
+	 * Keep scanning (wrap at tail) until chunk_target references are held or
+	 * we hit max_scan, so one chunk is not starved by an unlucky cursor.
+	 */
+	while (nr_cands < chunk_target && total_walked < max_scan) {
+		if (pos == head)
+			pos = head->next;
+		if (pos == head)
+			break;
+		for (; pos != head && nr_cands < chunk_target &&
+		       total_walked < max_scan; pos = next) {
+			struct page *page = compound_head(lru_to_page(pos));
+			next = pos->next;
 
-			if (page_to_pfn(p) == cursor_pfn) {
-				pos = it;
-				break;
+			total_walked++;
+
+			if (!PageAnon(page)) {
+#ifdef CONFIG_KAGGSWAPD_DEBUG
+				atomic64_inc(&kagg_dbg_miner_iso_skip_non_anon);
+#endif
+				continue;
 			}
+			if (PageHuge(page)) {
+#ifdef CONFIG_KAGGSWAPD_DEBUG
+				atomic64_inc(&kagg_dbg_miner_iso_skip_huge);
+#endif
+				continue;
+			}
+			if (!PageLRU(page)) {
+#ifdef CONFIG_KAGGSWAPD_DEBUG
+				atomic64_inc(&kagg_dbg_miner_iso_skip_not_lru_walk);
+#endif
+				continue;
+			}
+			if (unlikely(!page_evictable(page))) {
+#ifdef CONFIG_KAGGSWAPD_DEBUG
+				atomic64_inc(&kagg_dbg_miner_iso_skip_not_evictable);
+#endif
+				continue;
+			}
+			if (!get_page_unless_zero(page)) {
+#ifdef CONFIG_KAGGSWAPD_DEBUG
+				atomic64_inc(&kagg_dbg_miner_iso_skip_no_ref);
+#endif
+				continue;
+			}
+			cands[nr_cands++] = page;
 		}
 	}
-	for (; pos != head && nr_cands < chunk_target; pos = next) {
-		struct page *page = compound_head(lru_to_page(pos));
-		next = pos->next;
-
-		if (!PageAnon(page) || PageHuge(page) || !PageLRU(page))
-			continue;
-		if (unlikely(!page_evictable(page)))
-			continue;
-		if (!get_page_unless_zero(page))
-			continue;
-		cands[nr_cands++] = page;
-	}
-	if (pos != head) {
-		struct page *p = compound_head(lru_to_page(pos));
-
-		WRITE_ONCE(kagg_miner_cursor_pfn[nid], page_to_pfn(p));
-		WRITE_ONCE(kagg_miner_cursor_valid[nid], true);
+	if (pos == head) {
+		WRITE_ONCE(cursor_lru_steps[nid], 0);
 	} else {
-		WRITE_ONCE(kagg_miner_cursor_valid[nid], false);
+		WRITE_ONCE(cursor_lru_steps[nid], consumed + total_walked);
 	}
+#ifdef CONFIG_KAGGSWAPD_DEBUG
+	atomic64_add(total_walked, &kagg_dbg_miner_iso_walked_slots);
+	if (nr_cands < chunk_target) {
+		atomic64_inc(&kagg_dbg_miner_iso_chunk_underfill);
+		if (total_walked >= max_scan)
+			atomic64_inc(&kagg_dbg_miner_iso_chunk_maxscan_hit);
+	}
+#endif
 	spin_unlock_irq(&pgdat->lru_lock);
 
 	for (i = 0; i < nr_cands; i++) {
 		struct page *page = cands[i];
+		bool lrutest;
+		int err;
 
-		if (!isolate_lru_page(page)) {
+#ifdef CONFIG_KAGGSWAPD_DEBUG
+		atomic64_inc(&kagg_dbg_miner_iso_attempts);
+#endif
+		/*
+		 * isolate_lru_page() only distinguishes success vs -EBUSY; split
+		 * whether PageLRU was already clear before calling (race after LRU
+		 * walk unlocked) vs still LRU (lost under pgdat->lru_lock inside).
+		 */
+		lrutest = !!PageLRU(page);
+		err = isolate_lru_page(page);
+		if (!err) {
 			list_add_tail(&page->lru, local_list);
 			isolated_ok++;
 		} else {
+#ifdef CONFIG_KAGGSWAPD_DEBUG
+			if (!lrutest)
+				atomic64_inc(&kagg_dbg_miner_iso_fail_not_lru);
+			else
+				atomic64_inc(&kagg_dbg_miner_iso_fail_race);
+#endif
 			put_page(page);
 		}
 		if (!((i + 1) % KAGG_MINER_RESCHED_QUOTA))
@@ -786,6 +1364,8 @@ static unsigned int kagg_miner_isolate_chunk(struct pglist_data *pgdat,
 		cond_resched();
 #ifdef CONFIG_KAGGSWAPD_DEBUG
 	atomic64_add(isolated_ok, &kagg_dbg_miner_isolated_pages);
+	if (meta)
+		atomic64_add(isolated_ok, &meta->isolated_pages);
 #endif
 	return isolated_ok;
 }
@@ -822,7 +1402,8 @@ static void kagg_miner_bucketize_batch(struct list_head *batch_list,
 
 static void kagg_miner_cluster_and_putback(struct lruvec *lruvec,
 					   struct hlist_head *buckets,
-					   struct list_head *all_isolated)
+					   struct list_head *all_isolated,
+					   struct kagg_memcg_meta *meta)
 {
 	struct page *page, *next;
 	unsigned int i, work = 0;
@@ -831,35 +1412,73 @@ static void kagg_miner_cluster_and_putback(struct lruvec *lruvec,
 	unsigned int min_cluster = (unsigned int)clamp_val(
 		READ_ONCE(sysctl_dual_path_miner_min_cluster), 1,
 		KAGG_MINER_CLUSTER_MAX);
+	struct page_ext_agg_data **memd = kagg_miner_cluster_memd_buf;
+
+	kagg_miner_iso_nmap = kagg_miner_build_iso_sorted_map(all_isolated);
 
 	for (i = 0; i < KAGG_MINER_HASH_SIZE; i++) {
 		struct hlist_head *bucket = &buckets[i];
+		unsigned int bucket_seeds = 0;
 
 		while (!hlist_empty(bucket)) {
 			struct page_ext_agg_data *seed;
 			struct page_ext_agg_data *cand;
 			struct hlist_node *tmp;
-			unsigned int cnt = 0;
+			unsigned int nmem = 0;
+			unsigned int j;
+
+			if (++bucket_seeds > KAGG_MINER_BUCKET_SEED_MAX) {
+				kagg_miner_bucket_strip_nodes(bucket);
+#ifdef CONFIG_KAGGSWAPD_DEBUG
+				atomic64_inc(&kagg_dbg_miner_bucket_trunc);
+				if (meta)
+					atomic64_inc(&meta->bucket_trunc);
+#endif
+				pr_warn_ratelimited(
+					"kaggswapd: miner hash bucket seed cap (%u); stripping remaining nodes\n",
+					(unsigned int)KAGG_MINER_BUCKET_SEED_MAX);
+				break;
+			}
+
+			work++;
+			if (!(work % KAGG_MINER_RESCHED_QUOTA))
+				cond_resched();
 
 			seed = hlist_entry(bucket->first,
 					struct page_ext_agg_data, miner_node);
 			hlist_del_init(&seed->miner_node);
-			cnt++;
+			memd[nmem++] = seed;
 
 			hlist_for_each_entry_safe(cand, tmp, bucket, miner_node) {
-				if (cnt >= KAGG_MINER_CLUSTER_MAX)
+				work++;
+				if (!(work % KAGG_MINER_RESCHED_QUOTA))
+					cond_resched();
+				if (nmem >= KAGG_MINER_CLUSTER_MAX)
 					break;
 				if (!kagg_miner_similar(seed, cand, sim_pct))
 					continue;
 				hlist_del_init(&cand->miner_node);
-				cnt++;
+				memd[nmem++] = cand;
+			}
+
+			if (nmem < min_cluster) {
+				for (j = 0; j < nmem; j++) {
+					struct page_ext_agg_data *d = memd[j];
+					unsigned int idx = kagg_miner_hash_prefix(d);
+
+					hlist_add_head(&d->miner_node, &buckets[idx]);
+				}
 				work++;
 				if (!(work % KAGG_MINER_RESCHED_QUOTA))
 					cond_resched();
+				continue;
 			}
 
-			if (cnt >= min_cluster)
-				kagg_miner_emit_cluster(lruvec, cnt);
+			if (!kagg_miner_emit_cluster(lruvec, memd, nmem, meta))
+				kagg_miner_rebucket_agg_data(buckets, memd, nmem);
+			work++;
+			if (!(work % KAGG_MINER_RESCHED_QUOTA))
+				cond_resched();
 		}
 		cond_resched();
 	}
@@ -868,6 +1487,8 @@ static void kagg_miner_cluster_and_putback(struct lruvec *lruvec,
 		struct page_ext_agg *agg = lookup_page_ext_agg(page);
 		struct page_ext_agg_data *d = page_ext_agg_get_data_maybe(agg);
 
+		if (d && READ_ONCE(d->group))
+			continue;
 		if (d && !hlist_unhashed(&d->miner_node))
 			hlist_del_init(&d->miner_node);
 		list_del_init(&page->lru);
@@ -878,21 +1499,22 @@ static void kagg_miner_cluster_and_putback(struct lruvec *lruvec,
 			cond_resched();
 #ifdef CONFIG_KAGGSWAPD_DEBUG
 		atomic64_inc(&kagg_dbg_miner_putback_pages);
+		if (meta)
+			atomic64_inc(&meta->putback_pages);
 #endif
 	}
 }
 
-/* Mining plane entrypoint for one pgdat. */
-static void kagg_miner_scan_pgdat(struct pglist_data *pgdat,
-				  unsigned int seed_pct)
+static void kagg_miner_scan_lruvec(struct lruvec *lruvec, unsigned int seed_pct)
 {
-	struct lruvec *lruvec = mem_cgroup_lruvec(NULL, pgdat);
+	pg_data_t *pgdat = lruvec_pgdat(lruvec);
 	struct hlist_head *buckets = kagg_miner_bucket_buf;
 	LIST_HEAD(all_isolated);
 	unsigned long inactive_sz;
 	unsigned int view_target;
-	unsigned int total_isolated = 0;
+	unsigned int attempt_budget = 0;
 	unsigned int work = 0;
+	struct kagg_memcg_meta *meta = NULL;
 
 	if (!pgdat)
 		return;
@@ -900,24 +1522,63 @@ static void kagg_miner_scan_pgdat(struct pglist_data *pgdat,
 	view_target = kagg_percent_target(inactive_sz, seed_pct, KAGG_MINER_VIEW_MAX);
 	if (!view_target)
 		return;
+	meta = kagg_memcg_meta_get(lruvec_memcg(lruvec), true);
+#ifdef CONFIG_KAGGSWAPD_DEBUG
+	atomic64_add(view_target, &kagg_dbg_miner_view_target_pages);
+	if (view_target == KAGG_MINER_VIEW_MAX)
+		atomic64_inc(&kagg_dbg_miner_view_target_cap_hits);
+	if (meta) {
+		atomic64_inc(&meta->miner_rounds);
+		atomic64_add(view_target, &meta->view_target_pages);
+	}
+#endif
 
 	kagg_miner_init_buckets(buckets);
-	while (total_isolated < view_target) {
+	if (meta)
+		WRITE_ONCE(meta->cursor_lru_steps[pgdat->node_id], 0);
+	/*
+	 * One miner round consumes a fixed "view_target" worth of small-batch
+	 * attempts (chunk-sized), even if some batches transiently isolate 0
+	 * pages. Do not end the round early on an empty batch alone.
+	 */
+	while (attempt_budget < view_target) {
 		LIST_HEAD(batch_list);
 		unsigned int chunk = min_t(unsigned int, KAGG_MINER_BATCH_MAX,
-					   view_target - total_isolated);
+					   view_target - attempt_budget);
 		unsigned int got;
 
-		got = kagg_miner_isolate_chunk(pgdat, chunk, &batch_list);
-		if (!got)
-			break;
-		total_isolated += got;
-		kagg_miner_bucketize_batch(&batch_list, buckets, &work);
-		list_splice_tail_init(&batch_list, &all_isolated);
+		attempt_budget += chunk;
+		got = kagg_miner_isolate_chunk(lruvec, chunk, &batch_list, meta);
+		if (got) {
+			kagg_miner_bucketize_batch(&batch_list, buckets, &work);
+			list_splice_tail_init(&batch_list, &all_isolated);
+		}
 		cond_resched();
 	}
 	if (!list_empty(&all_isolated))
-		kagg_miner_cluster_and_putback(lruvec, buckets, &all_isolated);
+		kagg_miner_cluster_and_putback(lruvec, buckets, &all_isolated, meta);
+}
+
+/* Mining plane entrypoint for one pgdat: walk all memcg lruvecs. */
+static void kagg_miner_scan_pgdat(struct pglist_data *pgdat,
+				  unsigned int seed_pct)
+{
+#ifdef CONFIG_MEMCG
+	if (!mem_cgroup_disabled()) {
+		struct mem_cgroup *memcg = NULL;
+
+		while ((memcg = mem_cgroup_iter(NULL, memcg, NULL))) {
+			struct lruvec *lruvec;
+
+			if (!mem_cgroup_online(memcg))
+				continue;
+			lruvec = mem_cgroup_lruvec(memcg, pgdat);
+			kagg_miner_scan_lruvec(lruvec, seed_pct);
+		}
+		return;
+	}
+#endif
+	kagg_miner_scan_lruvec(mem_cgroup_lruvec(NULL, pgdat), seed_pct);
 }
 
 static int kaggswapd_fn(void *unused)
@@ -966,6 +1627,9 @@ static int kaggswapd_fn(void *unused)
 
 		if (READ_ONCE(sysctl_dual_path_miner_enable) &&
 		    time_after_eq(jiffies, next_miner_deadline)) {
+#ifdef CONFIG_KAGGSWAPD_DEBUG
+			atomic64_inc(&kagg_dbg_miner_block_start);
+#endif
 			for_each_online_pgdat(pgdat)
 				kagg_miner_scan_pgdat(pgdat, pct);
 			next_miner_deadline = jiffies +
@@ -990,6 +1654,14 @@ static int kaggswapd_fn(void *unused)
 static int __init kagg_scan_init(void)
 {
 	struct task_struct *tsk;
+#ifdef CONFIG_MEMCG
+	unsigned int i;
+#endif
+
+#ifdef CONFIG_MEMCG
+	for (i = 0; i < KAGG_MEMCG_META_HASH_SIZE; i++)
+		INIT_HLIST_HEAD(&kagg_memcg_meta_hash[i]);
+#endif
 
 	tsk = kthread_run(kaggswapd_fn, NULL, "kaggswapd");
 	if (IS_ERR(tsk)) {

@@ -11,6 +11,7 @@
 #include <linux/list.h>
 #include <linux/page_owner.h>
 #include <linux/page_idle.h>
+#include <linux/memcontrol.h>
 
 /*
  * struct page extension
@@ -100,9 +101,46 @@ struct page_ext_agg_data *__page_ext_agg_ensure_slow(struct page_ext_agg *agg)
 	return alloc;
 }
 
-static void page_ext_agg_data_destroy(struct page_ext_agg_data *data)
+static void page_ext_agg_leave_group(struct page *page,
+				     struct page_ext_agg_data *data)
 {
-	WARN_ON_ONCE(data->group);
+	struct page_group *grp;
+	struct page_group *grp_kfree = NULL;
+	struct pglist_data *pgdat;
+
+	page = compound_head(page);
+	grp = READ_ONCE(data->group);
+	if (!grp)
+		return;
+	pgdat = page_pgdat(page);
+	spin_lock_irq(&pgdat->lru_lock);
+	grp = data->group;
+	if (!grp) {
+		spin_unlock_irq(&pgdat->lru_lock);
+		return;
+	}
+	list_del_init(&page->lru);
+	WARN_ON_ONCE(grp->nr_pages == 0);
+	grp->nr_pages--;
+	WRITE_ONCE(data->group, NULL);
+	if (list_empty(&grp->page_list)) {
+		lruvec_page_group_del_init(grp);
+		grp_kfree = grp;
+	}
+	spin_unlock_irq(&pgdat->lru_lock);
+	if (grp_kfree)
+		kfree(grp_kfree);
+	/* isolate_lru_page() elevated refcount; not putback when grouped */
+	put_page(page);
+}
+
+static void page_ext_agg_data_destroy(struct page *page,
+				     struct page_ext_agg_data *data)
+{
+	if (page && data->group)
+		page_ext_agg_leave_group(page, data);
+	else if (!page && data->group)
+		WARN_ON_ONCE(1);
 	hlist_del_init(&data->miner_node);
 	kmem_cache_free(page_ext_agg_data_cache, data);
 }
@@ -116,7 +154,12 @@ void page_ext_agg_reset(struct page_ext_agg *agg)
 	data = xchg(&agg->data, NULL);
 	if (!data)
 		return;
-	page_ext_agg_data_destroy(data);
+	if (unlikely(data->group)) {
+		WARN_ON_ONCE(1);
+		WRITE_ONCE(agg->data, data);
+		return;
+	}
+	page_ext_agg_data_destroy(NULL, data);
 }
 
 /*
@@ -145,7 +188,7 @@ void dual_path_page_ext_prepare_free(struct page *page, unsigned int order)
 		data = xchg(&agg->data, NULL);
 		if (!data)
 			continue;
-		page_ext_agg_data_destroy(data);
+		page_ext_agg_data_destroy(page + i, data);
 	}
 }
 
